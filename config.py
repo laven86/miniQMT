@@ -115,7 +115,7 @@ def _env_int(name: str, default: int, min_value=None, max_value=None) -> int:
 
 # 模拟交易模式开关：环境变量 ENABLE_SIMULATION_MODE 优先（启动器控制），
 # 否则用源码默认 True（避免开发者本地误连实盘）。
-ENABLE_SIMULATION_MODE = _env_bool("ENABLE_SIMULATION_MODE", True)
+ENABLE_SIMULATION_MODE = _env_bool("ENABLE_SIMULATION_MODE", False)
 ENABLE_AUTO_OPERATION = False   # 全局自动操作总开关：关闭时自动策略不产生新交易动作
 ENABLE_AUTO_TRADING = False     # 非网格自动策略执行开关（不影响网格交易）
 ENABLE_ALLOW_BUY = True         # 是否允许买入操作
@@ -411,7 +411,7 @@ QMT_IPC_DONE_LOOKBACK_SECONDS = 86400
 # False（默认）: 不启用（现有行为不变）
 # True: 所有交易操作通过 RPC 路由到大QMT执行
 # ⚠️ 与 ENABLE_XTQUANT_MANAGER、ENABLE_QMT_IPC_FALLBACK 三者互斥
-ENABLE_QMT_RPC_FALLBACK = _env_bool("ENABLE_QMT_RPC_FALLBACK", False)
+ENABLE_QMT_RPC_FALLBACK = _env_bool("ENABLE_QMT_RPC_FALLBACK", True)
 # 传输方式：redis（默认，生产推荐）/ zmq（同机低延迟）/ mysql（兜底）
 QMT_RPC_TRANSPORT = os.environ.get("QMT_RPC_TRANSPORT", "redis")
 # Redis 连接配置（密码走环境变量，切勿硬编码）
@@ -428,7 +428,7 @@ QMT_RPC_ORDER_TIMEOUT = 30
 # 成交/委托回报轮询兜底间隔（秒），推送通道之外的补偿轮询
 QMT_RPC_DEAL_POLL_INTERVAL = 1.0
 # 下单二次确认开关：False 时即使 ENABLE_QMT_RPC_FALLBACK=True 也拒绝真实下单（只读安全）
-QMT_RPC_ALLOW_ORDER = _env_bool("QMT_RPC_ALLOW_ORDER", False)
+QMT_RPC_ALLOW_ORDER = _env_bool("QMT_RPC_ALLOW_ORDER", True)
 
 # ======================= 策略配置 =======================
 # 仓位管理

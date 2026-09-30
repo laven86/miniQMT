@@ -6,6 +6,7 @@ __pycache__/
 
 # 敏感配置文件（包含账户信息和QMT路径）
 account_config.json
+account_config_sim.json
 xtquant_manager_config.json
 
 # 数据库文件

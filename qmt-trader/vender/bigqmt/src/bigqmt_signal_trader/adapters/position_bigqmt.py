@@ -14,13 +14,22 @@ def _attr(obj, names, default=None):
 
 
 def _full_code(instrument_id, exchange_id):
+    # Return None for non-stock instruments reported by the broker terminal
+    # (e.g. pledge-style repo / cash-management products like RXL001.SZ): they
+    # are not plain 6-digit codes, have no tradable quotes, and must not leak
+    # into the position table as fake stocks. Callers skip rows whose code
+    # is None. Order/quote paths keep using normalize_stock_code directly so
+    # invalid codes still fail loudly there.
     code = str(instrument_id or "").strip().upper()
     market = str(exchange_id or "").strip().upper()
-    if "." in code:
+    try:
+        if "." in code:
+            return normalize_stock_code(code)
+        if market in ("SH", "SZ"):
+            return normalize_stock_code("%s.%s" % (code, market))
         return normalize_stock_code(code)
-    if market in ("SH", "SZ"):
-        return normalize_stock_code("%s.%s" % (code, market))
-    return normalize_stock_code(code)
+    except ValueError:
+        return None
 
 
 class BigQmtPositionProvider:
@@ -47,6 +56,10 @@ class BigQmtPositionProvider:
                 _attr(row, ("m_strInstrumentID", "instrument_id", "stock_code")),
                 _attr(row, ("m_strExchangeID", "exchange_id", "market")),
             )
+            if not code:
+                # Non-stock instrument (repo/cash product) — skip silently so
+                # it never appears in the position table as a fake stock.
+                continue
             positions[code] = PositionSnapshot(
                 stock_code=code,
                 volume=int(_attr(row, ("m_nVolume", "volume"), 0) or 0),
