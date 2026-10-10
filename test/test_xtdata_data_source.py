@@ -151,6 +151,30 @@ class TestGetLatestDataFallback(TestBase):
         mock_mootdx.assert_not_called()
         self.assertEqual(result.get('lastPrice'), 13.59)
 
+    def test_exempt_synthetic_repo_code_skips_all_sources(self):
+        """⭐柜台虚拟代码（888880 国债逆回购聚合）直接豁免：
+        不发任何行情请求（无 tick 缓存查询、无 get_full_tick、无 Mootdx 兜底）
+        ——否则每轮持仓轮询都会刷 WARNING/ERROR"""
+        with patch('config.is_trade_time', return_value=True), \
+             patch('Methods.getStockData') as mock_mootdx:
+            result = self.dm.get_latest_data('888880.SH')
+        self.assertIsNone(result)
+        self.mock_xt.get_full_tick.assert_not_called()
+        mock_mootdx.assert_not_called()
+
+    def test_exempt_synthetic_repo_code_bare_digits_also_exempted(self):
+        """裸 6 位柜台虚拟代码（无市场后缀）同样豁免；真实品种不受影响"""
+        with patch('config.is_trade_time', return_value=True), \
+             patch('Methods.getStockData') as mock_mootdx:
+            self.assertIsNone(self.dm.get_latest_data('888880'))
+        mock_mootdx.assert_not_called()
+        # 真实品种（601377）不豁免：应正常走行情链路
+        self.dm.get_latest_xtdata = MagicMock(return_value={'lastPrice': 11.5, 'lastClose': 11.4})
+        with patch('config.is_trade_time', return_value=True), \
+             patch('Methods.getStockData') as mock_mootdx:
+            result = self.dm.get_latest_data('601377.SH')
+        self.assertEqual(result.get('lastPrice'), 11.5)
+
     def test_get_latest_xtdata_records_health_success(self):
         """xtdata 成功返回时记录健康样本并附加元数据"""
         self.mock_xt.get_full_tick.return_value = {

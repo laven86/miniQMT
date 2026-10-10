@@ -43,6 +43,42 @@ def _create_xtdata():
         return _xtdata
 
 
+# 交易所真实品种的 6 位代码前两白名单段（沪深京 A股/B股/基金ETF/可转债/逆回购）。
+# 券商柜台会以合成代码上报非交易所品种的持仓（如 888880 国债逆回购聚合、
+# RXL001 质押式报价回购）：其中纯数字合成代码能通过常规代码归一化混进持仓表，
+# 但没有任何 tick / 历史 K 线，对它发起行情请求只会每轮轮询刷 WARNING/ERROR
+# （Mootdx 兜底还会因 BESTIP 空配置直接抛解包异常）。前两段不在此白名单内的
+# 6 位纯数字代码一律豁免：不请求行情、不请求历史，仅记 DEBUG。
+_EXCHANGE_CODE_PREFIXES = (
+    "00", "30",              # 深主板 / 创业板
+    "60", "68",              # 沪主板 / 科创板
+    "43", "83", "87", "92",  # 北交所 / 新三板
+    "90", "20",              # 沪B / 深B（20 段同时覆盖 204xxx 沪逆回购）
+    "40",                    # 老三板 400xxx
+    "50", "51", "56", "58",  # 沪基金 / ETF
+    "15", "16", "18",        # 深基金 / ETF
+    "11", "12", "13",        # 可转债（11 沪 / 12 深）；13 段含 1318xx 深逆回购
+)
+
+
+def is_exempt_market_code(stock_code):
+    """判定是否为应豁免行情/历史请求的柜台虚拟代码（非交易所品种）。
+
+    True  = 豁免：非交易所品种（如 888880 逆回购聚合），无 tick / 历史
+           数据，调用方不应发起任何行情或历史请求。
+    False = 正常交易所品种，或非常规格式代码（交由各链路原有逻辑处理）。
+    """
+    text = str(stock_code or "").strip().upper()
+    if not text:
+        return True
+    pure = text.split(".")[0]
+    # 仅拦截"6 位纯数字但不在交易所品种段"的柜台合成代码；字母类柜台
+    # 代码（如 RXL001）由上游归一化（normalize/ValueError）拦截。
+    if len(pure) == 6 and pure.isdigit():
+        return pure[:2] not in _EXCHANGE_CODE_PREFIXES
+    return False
+
+
 class MarketDataHealthTracker:
     """内存版行情源健康评分器，不落库，重启即清空。"""
 
@@ -1192,8 +1228,9 @@ class DataManager:
         下载股票历史数据。
 
         网关模式(ENABLE_XTQUANT_MANAGER=True)：xtdata → Tushare（日/周/月且启用）→ Mootdx。
-        标准模式(ENABLE_XTQUANT_MANAGER=False)：Tushare（日/周/月且启用）→ Mootdx，避免触碰
-        部分 QMT 客户端会进程级崩溃的 xtdata 历史接口。
+        标准模式：ENABLE_XTQUANT_HISTORY_DATA=True 时同样 xtdata 优先（本机
+        xtquant.xtdata 模块 + get_local_data 纯本地读）；开关关闭时 Tushare →
+        Mootdx，不触碰 xtdata 历史接口。
 
         参数:
         stock_code (str): 股票代码
@@ -1205,6 +1242,12 @@ class DataManager:
         pandas.DataFrame: 历史数据，若失败则返回None
         """
         stock_code = self._adjust_stock(stock_code)
+
+        # 柜台虚拟代码（如 888880 国债逆回购聚合持仓）没有历史数据，
+        # 请求只会逐级 fallback 报错 —— 直接豁免，不进任何数据源。
+        if is_exempt_market_code(stock_code):
+            logger.debug(f"豁免 {stock_code} 的历史数据请求（非交易所品种，无历史数据）")
+            return None
 
         # ── 历史数据源策略：网关模式优先 xtdata，标准模式跳过 xtdata ──
         effective_period = period or 'day'
@@ -1225,11 +1268,18 @@ class DataManager:
         if not xt_start_date:
             xt_start_date = (datetime.now() - timedelta(days=90)).strftime('%Y%m%d')
 
-        # ⚠️ 仅在 XtQuantManager 网关模式下用 xtdata 拉历史数据。
-        # 标准模式(ENABLE_XTQUANT_MANAGER=False)走 Mootdx：部分 QMT 客户端的
-        # xtdata.get_market_data_ex 会触发底层 BSON 断言 "u < 1000000"
-        # (bsonobj.cpp) 直接 abort 整个进程，且 try/except 与超时均无法拦截。
-        if getattr(config, 'ENABLE_XTQUANT_MANAGER', False) and self.xt:
+        # ⚠️ xtdata 历史数据入口门控：网关模式(ENABLE_XTQUANT_MANAGER=True)，或
+        # 显式开启 ENABLE_XTQUANT_HISTORY_DATA（标准模式下 self.xt 即本机
+        # xtquant.xtdata 模块，不引入 HTTP 服务依赖）。
+        # 历史上标准模式禁用 xtdata 历史的原因是 get_market_data_ex 在部分 QMT
+        # 客户端触发底层 BSON 断言 "u < 1000000"(bsonobj.cpp) 直接 abort 进程；
+        # 现 download_history_xtdata 已改用纯本地读取的 get_local_data，风险
+        # 接口不再被调用（回归测试锁定：get_market_data_ex 必须未被调用）。
+        _use_xt_history = (
+            getattr(config, 'ENABLE_XTQUANT_MANAGER', False)
+            or getattr(config, 'ENABLE_XTQUANT_HISTORY_DATA', False)
+        )
+        if _use_xt_history and self.xt:
             xt_df = self.download_history_xtdata(
                 stock_code,
                 period=xt_period,
@@ -1445,17 +1495,29 @@ class DataManager:
             # 等待数据下载完成
             time.sleep(0.5)
 
-            # 使用get_market_data_ex从本地获取下载的数据
-            # 注意第一个参数是字段列表，可以为空
+            # 优先 get_local_data 从本地读取已下载数据：纯本地读，无
+            # get_market_data_ex 在部分 QMT 客户端触发 BSON 断言 abort 的风险；
+            # XtQuantManager HTTP 适配器无此方法时回退 get_market_data_ex。
             executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-            future = executor.submit(
-                self.xt.get_market_data_ex,
-                [],  # 空字段列表表示获取所有可用字段
-                [xt_stock_code],
-                period=period,
-                start_time=start_date,
-                end_time=end_date
-            )
+            fetch_local = getattr(self.xt, 'get_local_data', None)
+            if callable(fetch_local):
+                future = executor.submit(
+                    fetch_local,
+                    field_list=[],  # 空字段列表表示获取所有可用字段
+                    stock_list=[xt_stock_code],
+                    period=period,
+                    start_time=start_date,
+                    end_time=end_date,
+                )
+            else:
+                future = executor.submit(
+                    self.xt.get_market_data_ex,
+                    [],  # 空字段列表表示获取所有可用字段
+                    [xt_stock_code],
+                    period=period,
+                    start_time=start_date,
+                    end_time=end_date,
+                )
             executor.shutdown(wait=False)  # 不等待线程，让其在后台独立结束
             try:
                 result = future.result(timeout=10.0)  # 10秒超时
@@ -1474,6 +1536,12 @@ class DataManager:
 
             if xt_stock_code in result:
                 stock_data = result[xt_stock_code]
+                # get_local_data/get_market_data_ex 返回以时间为索引的 DataFrame，
+                # 下游清洗链路（_normalize_history_dates 等）需要 time 列
+                if isinstance(stock_data, pd.DataFrame) and 'time' not in stock_data.columns and 'date' not in stock_data.columns:
+                    stock_data = stock_data.reset_index()
+                    if 'time' not in stock_data.columns and 'index' in stock_data.columns:
+                        stock_data = stock_data.rename(columns={'index': 'time'})
                 df = pd.DataFrame(stock_data)
             else:
                 logger.warning(f"获取的数据中没有 {xt_stock_code}, 可用的键: {list(result.keys())}")
@@ -2167,6 +2235,13 @@ class DataManager:
         """
         try:
             adjusted_code = self._adjust_stock(stock_code)
+
+            # 柜台虚拟代码（如 888880 国债逆回购聚合持仓）：非交易所品种，
+            # 无任何 tick / 历史数据，发起请求只会周期性刷 WARNING/ERROR
+            # （Mootdx 兜底还会因 BESTIP 空配置抛解包异常）—— 直接豁免。
+            if is_exempt_market_code(adjusted_code):
+                logger.debug(f"豁免 {stock_code} 的行情请求（非交易所品种，无行情数据）")
+                return None
 
             # 在交易时间内，优先使用实时数据管理器
             if config.is_trade_time():

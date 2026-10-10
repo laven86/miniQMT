@@ -142,6 +142,40 @@ class BigQmtAdaptersTest(unittest.TestCase):
         self.assertEqual(positions["510300.SH"].available, 800)
         self.assertEqual(positions["510300.SH"].cost, 3.456)
 
+    def test_position_provider_skips_synthetic_repo_code(self):
+        # 888880 is the broker terminal's synthetic reverse-repo holding code:
+        # pure digits (so it passes normalize_stock_code) but outside the real
+        # exchange prefixes. It must be dropped; real holdings in the same
+        # snapshot must survive.
+        def fake_query(account, account_type, detail_type, *args):
+            if detail_type == "POSITION":
+                return [
+                    Obj(
+                        m_strInstrumentID="888880",
+                        m_strExchangeID="SH",
+                        m_nVolume=1000,
+                        m_nCanUseVolume=1000,
+                        m_dOpenPrice=0.0,
+                        m_strInstrumentName="国债逆回购",
+                    ),
+                    Obj(
+                        m_strInstrumentID="601377",
+                        m_strExchangeID="SH",
+                        m_nVolume=100,
+                        m_nCanUseVolume=100,
+                        m_dOpenPrice=3.21,
+                        m_strInstrumentName="盛和资源",
+                    ),
+                ]
+            return []
+
+        provider = BigQmtPositionProvider(fake_query)
+        positions = provider.get_positions("acct")
+
+        self.assertNotIn("888880.SH", positions)
+        self.assertEqual(len(positions), 1)
+        self.assertEqual(positions["601377.SH"].volume, 100)
+
     def test_order_gateway_submit_uses_qmt_jq_trade_passorder_shape(self):
         calls = []
 

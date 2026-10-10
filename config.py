@@ -142,6 +142,16 @@ BAOSTOCK_MAX_CONSECUTIVE_FAILURES = 3  # 连续失败N次后进入冷却期
 # 为空则匿名访问（免费数据仍可用）。⚠️ 必须用环境变量，切勿硬编码。
 BAOSTOCK_API_KEY = os.environ.get("BAOSTOCK_API_KEY", "")
 
+# ============ 历史数据源：本机 xtdata 优先开关 ============
+# True: 历史 K 线优先走本机 xtdata（download_history_data + get_local_data，
+#   经 XtMiniQmt 官方数据服务），取不到再降级 Tushare → Mootdx。
+#   与 ENABLE_XTQUANT_MANAGER 无关：标准模式下 self.xt 即本机 xtquant.xtdata 模块，
+#   不引入 HTTP 服务依赖，也不触发交易接口三选一互斥。
+# 背景：2026-09 起 TDX 公网主站对行情类命令（bars/quotes）静默返回空，Mootdx
+#   历史通道整体失效；本机 xtdata 路径实测全品种可用。
+# False（默认）: 标准模式跳过 xtdata 历史，维持 Tushare → Mootdx 旧行为。
+ENABLE_XTQUANT_HISTORY_DATA = _env_bool("ENABLE_XTQUANT_HISTORY_DATA", True)
+
 # ============ Tushare Pro 数据源配置 ============
 # Tushare 数据源总开关。True = 在标准模式下优先于 Mootdx 使用 Tushare 获取历史数据，
 # 并在 get_stock_name 链路中 xtdata 之后、baostock 之前插入 Tushare 查询。

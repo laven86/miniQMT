@@ -13,23 +13,50 @@ def _attr(obj, names, default=None):
     return default
 
 
+# Leading two-digit prefixes of real exchange-listed 6-digit instruments.
+# Broker terminals also report synthetic holdings whose codes are pure digits
+# and therefore pass normalize_stock_code (e.g. 888880 aggregated reverse-repo
+# / cash-management products), yet they are not exchange instruments: no
+# quotes, no history. _full_code drops them so the position table and the
+# downstream 10s quote polling never see them.
+_EXCHANGE_CODE_PREFIXES = (
+    "00", "30",                    # SZ main board / ChiNext
+    "60", "68",                    # SH main board / STAR
+    "43", "83", "87", "92",        # BSE / NEEQ
+    "90", "20",                    # B-shares; 20 also covers 204xxx SH reverse repo
+    "40",                          # NEEQ two-board (400xxx)
+    "50", "51", "56", "58",        # SH funds / ETF
+    "15", "16", "18",              # SZ funds / ETF
+    "11", "12", "13",              # CBs: 11x SH / 12x SZ; 1318xx SZ reverse repo
+)
+
+
 def _full_code(instrument_id, exchange_id):
-    # Return None for non-stock instruments reported by the broker terminal
-    # (e.g. pledge-style repo / cash-management products like RXL001.SZ): they
-    # are not plain 6-digit codes, have no tradable quotes, and must not leak
-    # into the position table as fake stocks. Callers skip rows whose code
-    # is None. Order/quote paths keep using normalize_stock_code directly so
-    # invalid codes still fail loudly there.
+    # Return None for non-stock instruments reported by the broker terminal:
+    # 1) letter-coded products (e.g. pledge-style repo RXL001.SZ) rejected by
+    #    normalize_stock_code;
+    # 2) synthetic pure-digit codes outside the real exchange prefixes above
+    #    (e.g. 888880 aggregated reverse repo), which pass normalization but
+    #    are not tradable securities.
+    # They have no quotes and must not leak into the position table as fake
+    # stocks. Callers skip rows whose code is None. Order/quote paths keep
+    # using normalize_stock_code directly so invalid codes still fail loudly
+    # there.
     code = str(instrument_id or "").strip().upper()
     market = str(exchange_id or "").strip().upper()
     try:
         if "." in code:
-            return normalize_stock_code(code)
-        if market in ("SH", "SZ"):
-            return normalize_stock_code("%s.%s" % (code, market))
-        return normalize_stock_code(code)
+            full = normalize_stock_code(code)
+        elif market in ("SH", "SZ"):
+            full = normalize_stock_code("%s.%s" % (code, market))
+        else:
+            full = normalize_stock_code(code)
     except ValueError:
         return None
+    pure = full.split(".")[0]
+    if pure[:2] not in _EXCHANGE_CODE_PREFIXES:
+        return None
+    return full
 
 
 class BigQmtPositionProvider:
