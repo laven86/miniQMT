@@ -140,6 +140,10 @@ class BigQmtOrderGateway:
                     price=float(_attr(row, ("m_dLimitPrice", "m_dPrice", "price"), 0.0) or 0.0),
                     strategy_name=str(_attr(row, ("m_strStrategyName", "strategy_name"), "") or ""),
                     remark=str(_attr(row, ("m_strRemark", "remark"), "") or ""),
+                    # 委托时间：大QMT get_trade_detail_data 的 ORDER 行时间字段名无
+                    # 权威文档，多候选名提取原值（int/str 均可），由 miniQMT 端
+                    # format_order_time 按形态归一；提取不到保持空串走客户端兜底。
+                    order_time=str(_attr(row, ("m_strInsertTime", "m_nTime", "m_strOrderTime", "insert_time", "order_time"), "") or ""),
                 )
             )
         return result

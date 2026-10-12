@@ -1609,6 +1609,8 @@ class BigQmtXtTrader:
             order_id=order_sysid or str(item.get("user_order_id") or ""),
             strategy_name=str(item.get("strategy_name") or ""),
             order_remark=str(item.get("remark") or item.get("user_order_id") or ""),
+            # 柜台委托时间原样透传（老服务端无此键 -> 空串，走 miniQMT 端兜底）
+            order_time=item.get("order_time", ""),
         )
 
     def _trade_from_dict(self, account_id, item):

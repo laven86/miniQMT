@@ -26,6 +26,13 @@
 
 > 源路径：`qmt-trader/vender/bigqmt/src/`
 
+> **改动生效边界（重要）**：入口壳每次运行只显式 reload `redis_common / redis_rpc /
+> bigqmt_signal_trader_strategy / *_runtime`（strategy.py 另会强制 reload
+> `adapter_factory`）。`bigqmt_signal_trader/adapters/` 下的各适配器与 `models.py`
+> **不在 reload 清单内——拷贝后仅重跑策略不生效，必须完整退出并重启大QMT客户端**
+> 再重跑策略。改动大多落在 redis_rpc.py（重跑即可生效）；动适配层/models 前先确认
+> 能接受客户端重启成本。
+
 ### 1.2 创建私有配置（不提交）
 
 在大QMT的 `python` 目录新建 `bigqmt_signal_trader_local_config.py`（参考 `bigqmt_signal_trader_local_config.example.py`）：

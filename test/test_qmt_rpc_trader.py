@@ -109,6 +109,7 @@ class FakeRpcClient:
             "status": self._orders.get(uid, {}).get("status", "50"),
             "price": self._orders.get(uid, {}).get("price", 10.0),
             "strategy_name": self._orders.get(uid, {}).get("strategy_name", ""),
+            "order_time": self._orders.get(uid, {}).get("order_time", ""),
         }
 
     def call(self, method, params=None, account_id=None, timeout_seconds=None):
@@ -424,6 +425,54 @@ class QmtRpcTraderTest(unittest.TestCase):
         orders = t._read_all_orders()
         self.assertEqual(orders[0].order_id, oid)
 
+    def test_read_all_orders_queries_without_strategy_filter(self):
+        """当日委托必须查柜台全部委托：RPC 请求显式带 strategy_name=''。
+        vendored 默认值 'bigqmt_signal_trader' 匹配不到本进程任何下单标识
+        （M_real/GRID_*），曾导致当日委托/挂单判断恒为空；redis_rpc 服务端
+        的 handler 也必须保留空串语义（缺失 key 才用默认值）。"""
+        t = self._make()
+        t.buy("600000.SH", amount=100, price=10.0)
+        t._read_all_orders()
+        query_calls = [c for c in t._bq.client.calls
+                       if c[0] == "query_stock_orders"]
+        self.assertTrue(query_calls)
+        self.assertEqual(query_calls[-1][1].get("strategy_name"), "")
+
+    def test_counter_order_time_wins_over_fallbacks(self):
+        """柜台回传 order_time 时原样优先（服务端新链路的主路径）。"""
+        t = self._make()
+        t._bq.client._orders["bq:manual"] = {
+            "order_sys_id": "sys9", "user_order_id": "bq:manual", "remark": "bq:manual",
+            "stock_code": "601800.SH", "action": "BUY", "volume": 100,
+            "traded_volume": 0, "status": "50", "price": 6.13,
+            "strategy_name": "", "order_time": "1791529200",
+        }
+        orders = t._read_all_orders()
+        self.assertEqual(len(orders), 1)
+        self.assertEqual(orders[0].order_time, "1791529200")
+
+    def test_own_order_time_falls_back_to_placed_at(self):
+        """老服务端（不回传时间）时，本进程下单的单用下单时刻 placed_at。"""
+        t = self._make()
+        oid = t.buy("600000.SH", amount=100, price=10.0)
+        orders = t._read_all_orders()
+        self.assertEqual(len(orders), 1)
+        self.assertEqual(orders[0].order_time, t._id_map[oid]["placed_at"])
+
+    def test_foreign_order_time_is_first_seen_and_stable(self):
+        """外部单（非本进程所下）无时间：首见时刻缓存，重复查询不漂移。"""
+        t = self._make()
+        t._bq.client._orders["bq:ext"] = {
+            "order_sys_id": "sys7", "user_order_id": "bq:ext", "remark": "bq:ext",
+            "stock_code": "588080.SH", "action": "BUY", "volume": 100,
+            "traded_volume": 0, "status": "50", "price": 1.44,
+            "strategy_name": "",
+        }
+        first = t._read_all_orders()[0].order_time
+        second = t._read_all_orders()[0].order_time
+        self.assertTrue(first)
+        self.assertEqual(first, second)
+
     # ==================================================================
     # 回调：order + trade 去重触发（原有 + 扩展）
     # ==================================================================
@@ -553,6 +602,22 @@ class QmtRpcTraderTest(unittest.TestCase):
         df = t.query_stock_positions()
         self.assertEqual(df.iloc[0]["证券代码"], "600000")
         self.assertEqual(df.iloc[0]["股票余额"], 1000)
+
+    def test_position_filters_repo_and_standard_bond_rows(self):
+        """逆回购（204xxx/205xxx/1318xx）与标准券（1319xx）行不进持仓表。
+
+        实测 2026-10-12：柜台对逆回购业务双行记账（131810 回购合约 +
+        131990 标准券，数量一致可用皆 0），其"价格"是年化收益率、成本为 0，
+        按证券持仓口径算市值/涨幅/盈亏全是荒谬值，且标准券行无行情会让
+        持仓轮询每 10 秒刷一对 W+E。
+        """
+        t = self._make()
+        c = t._bq.client
+        c.add_position("131810.SZ", 4430, available=0, cost=0, stock_name="Ｒ-001")
+        c.add_position("131990.SZ", 4430, available=0, cost=0, stock_name="国标准券")
+        c.add_position("204001.SH", 100, stock_name="GC001")
+        codes = list(t.position()["证券代码"])
+        self.assertEqual(codes, ["600000"])
 
     def test_position_without_available_field_degrades_to_zero(self):
         """持仓缺失 available/can_use_volume 字段时，vendored 层 _safe_int(None)=0。

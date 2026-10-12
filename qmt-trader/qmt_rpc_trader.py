@@ -139,6 +139,7 @@ class QmtRpcTrader:
         self._sysid_index = {}     # order_sys_id -> int_id
         self._seen_orders = set()  # 已触发 order_callback 的 (int_id, status)
         self._seen_deals = {}      # int_id -> 已推送过的累计成交量
+        self._order_first_seen = {}  # 外部委托键 -> 首见时刻（柜台无时间时兑底）
 
         # 回调列表
         self._trade_callbacks = []
@@ -337,6 +338,18 @@ class QmtRpcTrader:
                 self._trim_tracking_locked()
             return int_id
 
+    def _first_seen_order_time(self, o):
+        """外部委托（非本进程所下）且柜台未回传时间时，锁定首次查询时刻，
+        避免时间列随轮询漂移。键取柜台唯一标识（sysid > remark > 代码）。"""
+        key = str(getattr(o, 'order_sysid', '') or getattr(o, 'order_remark', '')
+                  or getattr(o, 'stock_code', ''))
+        with self._map_lock:
+            ts = self._order_first_seen.get(key)
+            if ts is None:
+                ts = int(time.time())
+                self._order_first_seen[key] = ts
+            return ts
+
     def _fire_order(self, int_id, o):
         for cb in self._order_callbacks:
             try:
@@ -404,6 +417,9 @@ class QmtRpcTrader:
         if len(self._seen_deals) > 4096:
             for k in list(self._seen_deals)[:2048]:
                 self._seen_deals.pop(k, None)
+        if len(self._order_first_seen) > 4096:
+            for k in list(self._order_first_seen)[:2048]:
+                self._order_first_seen.pop(k, None)
 
     def _bq_order_to_fake(self, order):
         return base.FakeXtObject(
@@ -412,7 +428,8 @@ class QmtRpcTrader:
             stock_code=str(getattr(order, 'stock_code', '')),
             order_id=getattr(order, 'order_id', ''),
             order_sysid=str(getattr(order, 'order_sysid', '') or getattr(order, 'order_sys_id', '')),
-            order_time=int(time.time()),
+            # 柜台委托时间原样透传（int/str 均可）；缺失时由 _read_all_orders 兜底
+            order_time=getattr(order, 'order_time', None),
             order_type=getattr(order, 'order_type', base.STOCK_BUY),
             order_volume=int(getattr(order, 'order_volume', 0) or 0),
             price_type=50,
@@ -477,6 +494,7 @@ class QmtRpcTrader:
                     'user_order_id': ret_str, 'order_sys_id': None,
                     'stock_code': code, 'action': action, 'volume': int(volume),
                     'order_remark': order_remark or '', 'wire_remark': wire_remark,
+                    'placed_at': int(time.time()),
                 }
                 self._return_index[ret_str] = int_id
                 self._return_index[str(int_id)] = int_id
@@ -556,11 +574,20 @@ class QmtRpcTrader:
     # 账户查询（持仓/资产）
     # ------------------------------------------------------------------
 
+    # 质押式逆回购与标准券代码段：204xxx/205xxx 沪逆回购、1318xx 深逆回购、
+    # 1319xx 质押库标准券行（柜台对逆回购业务双行记账，实测 2026-10-12
+    # 131810 与 131990 数量一致、可用皆 0）。这些行的"价格"是年化收益率、
+    # 成本价为 0，按证券持仓口径算出的市值/涨幅/盈亏全是荒谬值；标准券
+    # 行无行情，还会让持仓轮询每 10 秒刷一对 W+E。持仓出口统一过滤，
+    # 到期柜台自动清算，无需本系统处理。
+    _REPO_CODE_PREFIXES = ('204', '205', '1318', '1319')
+
     def position(self):
         """查询持仓，兼容 easy_qmt_trader.position()。返回 DataFrame。
 
         RPC 持仓无实时市价，市值按 成本价*余额 兜底（data_manager 后续用现价刷新）。
         必需 5 列：证券代码/股票余额/可用余额/成本价/市值。
+        逆回购/标准券行（_REPO_CODE_PREFIXES）在出口过滤，不进持仓表。
         """
         empty = base.empty_df(base.POSITION_COLUMNS)
         try:
@@ -574,6 +601,9 @@ class QmtRpcTrader:
         for pos in positions:
             stock = str(getattr(pos, 'stock_code', ''))
             code6 = stock.split('.')[0] if '.' in stock else stock
+            if code6.startswith(self._REPO_CODE_PREFIXES):
+                logger.debug(f'跳过逆回购/标准券持仓行 {stock}')
+                continue
             volume = int(getattr(pos, 'volume', 0) or 0)
             available = int(getattr(pos, 'can_use_volume', getattr(pos, 'available_amount', volume)) or 0)
             cost = float(getattr(pos, 'cost_price', getattr(pos, 'avg_price', 0)) or 0)
@@ -648,7 +678,11 @@ class QmtRpcTrader:
     def _read_all_orders(self, cancelable_only=False):
         """查询委托列表，归一为内部 _FakeXtObject（order_id 映射为 int）。"""
         try:
-            raw = self._bq.query_stock_orders(self._bq_acc, cancelable_only=cancelable_only) or []
+            # strategy_name='' 显式查柜台当日全部委托（本进程策略单 M_real/GRID_*、
+            # 客户端手动单一并返回）。vendored 默认值 'bigqmt_signal_trader' 匹配
+            # 不到本进程任何下单标识，曾导致当日委托/挂单判断恒为空。
+            raw = self._bq.query_stock_orders(
+                self._bq_acc, cancelable_only=cancelable_only, strategy_name='') or []
         except Exception as e:
             logger.warning(f'RPC 查询委托失败: {e}')
             return []
@@ -658,6 +692,15 @@ class QmtRpcTrader:
             int_id = self._reconcile(o)
             if int_id is not None:
                 o.order_id = int_id
+            if not getattr(o, 'order_time', None):
+                # 委托时间三级兜底：柜台真实时间（已在 fake 上）→ 本进程下单
+                # 时刻（placed_at）→ 外部单首见时刻。老服务端不带 order_time 时
+                # 本进程的单仍有准确时间，外部单至少不再随轮询漂移。
+                placed = None
+                if int_id is not None:
+                    with self._map_lock:
+                        placed = self._id_map.get(int_id, {}).get('placed_at')
+                o.order_time = placed or self._first_seen_order_time(o)
             result.append(o)
         if cancelable_only:
             result = [o for o in result if o.order_status in base.ACTIVE_ORDER_STATUS]

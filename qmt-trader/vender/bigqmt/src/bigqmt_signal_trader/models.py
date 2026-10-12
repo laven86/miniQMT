@@ -231,6 +231,7 @@ class OrderSnapshot:
         price=0.0,
         strategy_name="",
         remark="",
+        order_time="",
     ):
         self.order_sys_id = order_sys_id
         self.user_order_id = user_order_id
@@ -242,6 +243,7 @@ class OrderSnapshot:
         self.price = price
         self.strategy_name = strategy_name
         self.remark = remark
+        self.order_time = order_time
 
 
 class TradeSnapshot:

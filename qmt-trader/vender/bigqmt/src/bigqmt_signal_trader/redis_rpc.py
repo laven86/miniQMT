@@ -418,9 +418,17 @@ class BigQmtRpcHandlers:
     def _handle_query_orders(self, params):
         if self.order_gateway is None:
             raise RuntimeError("order_gateway is not configured")
+        # Keep the default only for a MISSING key: an explicit empty string is
+        # the client's "no strategy-name filter" request (all of today's
+        # orders, incl. client-placed ones). The old `or` fallback swallowed
+        # that legal empty value, so miniQMT's own M_real / GRID_* orders never
+        # showed up in any query.
+        strategy_name = params.get("strategy_name")
+        if strategy_name is None:
+            strategy_name = "bigqmt_signal_trader"
         orders = self.order_gateway.query_orders(
             self._request_account_id(params),
-            str(params.get("strategy_name") or "bigqmt_signal_trader"),
+            str(strategy_name),
         )
         if _bool_value(params.get("cancelable_only"), False):
             return [
@@ -433,9 +441,13 @@ class BigQmtRpcHandlers:
     def _handle_query_trades(self, params):
         if self.order_gateway is None:
             raise RuntimeError("order_gateway is not configured")
+        # Same as _handle_query_orders: explicit "" means no filter.
+        strategy_name = params.get("strategy_name")
+        if strategy_name is None:
+            strategy_name = "bigqmt_signal_trader"
         return self.order_gateway.query_trades(
             self._request_account_id(params),
-            str(params.get("strategy_name") or "bigqmt_signal_trader"),
+            str(strategy_name),
         )
 
     def _handle_sync_positions(self, params):

@@ -31,7 +31,10 @@ def format_order_time(value):
     """格式化委托时间为 'YYYY-MM-DD HH:MM:SS'。
 
     QMT 的 order_time 是 Unix 秒级时间戳(int)，不能按字符串日期解析；
-    同时兼容已经是字符串/datetime 的情形。无法解析时返回 None。
+    大QMT RPC 柜台行的委托时间还可能以紧凑日期时间（YYYYMMDDHHMMSS）、
+    HHMMSS 小整数（如 93001）或当日秒数出现，按数量级归一（当日委托，
+    日期一律取今天）。同时兼容已经是字符串/datetime 的情形。
+    无法解析时返回 None。
     """
     if value is None:
         return None
@@ -43,7 +46,26 @@ def format_order_time(value):
         if value <= 0:
             return None
         try:
-            return datetime.fromtimestamp(value).strftime('%Y-%m-%d %H:%M:%S')
+            digits = str(int(value))
+            if len(digits) == 14 and digits[:2] in ('19', '20'):
+                # 紧凑日期时间 YYYYMMDDHHMMSS
+                return datetime.strptime(
+                    digits, '%Y%m%d%H%M%S').strftime('%Y-%m-%d %H:%M:%S')
+            if value >= 1_000_000_000:
+                # Unix 秒级时间戳
+                return datetime.fromtimestamp(value).strftime('%Y-%m-%d %H:%M:%S')
+            if value <= 235_959:
+                # HHMMSS 小整数（93001 -> 09:30:01）；非法形态再按当日秒数解读
+                try:
+                    parsed = datetime.strptime('%06d' % int(value), '%H%M%S')
+                    return datetime.now().strftime('%Y-%m-%d ') + parsed.strftime('%H:%M:%S')
+                except ValueError:
+                    pass
+                if value <= 86_400:
+                    h, rem = divmod(int(value), 3600)
+                    m, s = divmod(rem, 60)
+                    return datetime.now().strftime('%Y-%m-%d ') + '%02d:%02d:%02d' % (h, m, s)
+            return None
         except (ValueError, OSError, OverflowError):
             return None
 

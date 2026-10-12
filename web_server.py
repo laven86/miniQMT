@@ -1634,6 +1634,224 @@ def execute_buy():
             'message': f"执行买入操作失败: {str(e)}"
         }), 500
 
+# ======================= 外部交易接口（策略脚本 / 交易面板调用） =======================
+# 供 chan 平台 TradeService、用户 Python 策略脚本等外部消费者调用。
+# 与 execute_buy（备选池随机/批量语义）互补，这里提供"单只精确买卖 + 撤单 + 账户"四个接口。
+# 全部薄封装既有能力：manual_buy/manual_sell（含权限、资金、交易时间、防重、落库）与
+# position_manager._cancel_order（含 int 转换与 3 次重试），Web 层不做重复业务校验。
+
+def _format_stock_code_for_trade(stock):
+    """统一外部传入的股票代码格式：剥离已有市场后缀后，
+    模拟模式补全 .SH/.SZ/.BJ 后缀（Methods.add_xt_suffix），实盘模式用裸 6 位代码。
+    与 execute_buy 的格式化逻辑保持一致。"""
+    code = str(stock or '').strip()
+    if code.endswith(('.SH', '.SZ', '.BJ', '.sh', '.sz', '.bj')):
+        code = code.split('.')[0]
+    if getattr(config, 'ENABLE_SIMULATION_MODE', False):
+        return Methods.add_xt_suffix(code)
+    return code
+
+
+def _coerce_trade_number(value, field, as_int=False):
+    """外部 JSON 数值参数规整：None 透传，其余转 float（as_int 时须为整数值）。
+    布尔 / NaN / inf / 非整数浮点一律 ValueError（由调用方返回 400），
+    不做静默截断或放行到柜台（P2-8 加固）。"""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise ValueError(f"{field} 不能是布尔值: {value!r}")
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{field} 必须是数字: {value!r}")
+    if number != number or number in (float('inf'), float('-inf')):
+        raise ValueError(f"{field} 不能是 NaN 或无穷大: {value!r}")
+    if as_int:
+        if number != int(number):
+            raise ValueError(f"{field} 必须是整数: {value!r}")
+        return int(number)
+    return number
+
+
+# QMT A股报价类型白名单（xtconstant.py 全集；期货类 18-24 不对股票开放）。
+# 与 chan 侧 api_server/schemas.py 的 Literal 约束构成双闸：越权值在此 400，
+# 不直通柜台 passorder。5=最新价 11=限价 42/43=沪五档 44/45=对手方/本方最优
+# 46/47/48=深 即时剩撤/五档剩撤/全额成或撤。
+_ALLOWED_PRICE_TYPES = {5, 11, 42, 43, 44, 45, 46, 47, 48}
+
+
+def _coerce_price_type(value):
+    """报价类型规整：None -> 5（保持既有默认=最新价，存量调用方零影响）；
+    白名单外或非整数一律 ValueError（由调用方返回 400）。"""
+    if value is None:
+        return 5
+    try:
+        pt = int(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"price_type 必须是整数: {value!r}")
+    if pt not in _ALLOWED_PRICE_TYPES:
+        raise ValueError(f"不支持的 price_type: {pt}（允许: {sorted(_ALLOWED_PRICE_TYPES)}）")
+    return pt
+
+
+@app.route('/api/actions/buy_single', methods=['POST'])
+@require_token
+def buy_single():
+    """单只指定买入：volume（股数）与 amount（金额）至少提供一个。
+
+    参数透传 strategy.manual_buy，受 ENABLE_ALLOW_BUY/交易时间/资金校验约束；
+    price_type 缺省为 5（最新价，柜台忽略 price 按下单瞬间最新价撮合）；
+    传 11（限价）时 price 必填且柜台按显式价挂单；42-48 为交易所原生
+    市价类。市价类不带 price 时执行器仍会自动取参考价（卖三→卖一→
+    最新价），仅用于资金预检与流水落库，柜台撮合时忽略。
+    """
+    try:
+        data = request.get_json(silent=True) or {}
+        stock_code = str(data.get('stock_code') or '').strip()
+        if not stock_code:
+            return jsonify({'status': 'error', 'message': 'stock_code 不能为空'}), 400
+
+        try:
+            volume = _coerce_trade_number(data.get('volume'), 'volume', as_int=True)
+            price = _coerce_trade_number(data.get('price'), 'price')
+            amount = _coerce_trade_number(data.get('amount'), 'amount')
+            price_type = _coerce_price_type(data.get('price_type'))
+        except ValueError as e:
+            return jsonify({'status': 'error', 'message': str(e)}), 400
+
+        if volume is None and amount is None:
+            return jsonify({'status': 'error', 'message': 'volume 与 amount 至少提供一个'}), 400
+
+        if price_type == 11 and (price is None or price <= 0):
+            return jsonify({'status': 'error',
+                            'message': '限价单(price_type=11)必须提供正数 price'}), 400
+
+        formatted = _format_stock_code_for_trade(stock_code)
+        logger.info(f"[外部买入] {stock_code} -> {formatted}, volume={volume}, price={price}, amount={amount}, price_type={price_type}")
+        order_id = trading_strategy.manual_buy(
+            stock_code=formatted, volume=volume, price=price, amount=amount,
+            price_type=price_type)
+
+        if order_id:
+            return jsonify({
+                'status': 'success', 'order_id': order_id, 'stock_code': formatted,
+                'message': f'买入指令已提交: {formatted}',
+            })
+        return jsonify({
+            'status': 'failed', 'order_id': None, 'stock_code': formatted,
+            'message': f'买入未成功: {formatted}（原因见服务端日志：权限开关/资金/交易时间等）',
+        })
+    except Exception as e:
+        logger.error(f"单只买入操作出错: {str(e)}")
+        return jsonify({'status': 'error', 'message': f'买入操作失败: {str(e)}'}), 500
+
+
+@app.route('/api/actions/sell', methods=['POST'])
+@require_token
+def sell_single():
+    """单只指定卖出：volume（股数）与 ratio（0-1 比例）至少提供一个。
+
+    参数透传 strategy.manual_sell，受 ENABLE_ALLOW_SELL/交易时间/持仓校验约束；
+    price_type 语义与 buy_single 一致：缺省 5（最新价），11=限价须带 price，
+    42-48 为交易所原生市价类。市价类不带 price 时执行器仍会自动取参考价
+    （买三→买一→最新价），仅用于落库，柜台撮合时忽略。
+    """
+    try:
+        data = request.get_json(silent=True) or {}
+        stock_code = str(data.get('stock_code') or '').strip()
+        if not stock_code:
+            return jsonify({'status': 'error', 'message': 'stock_code 不能为空'}), 400
+
+        try:
+            volume = _coerce_trade_number(data.get('volume'), 'volume', as_int=True)
+            price = _coerce_trade_number(data.get('price'), 'price')
+            ratio = _coerce_trade_number(data.get('ratio'), 'ratio')
+            price_type = _coerce_price_type(data.get('price_type'))
+        except ValueError as e:
+            return jsonify({'status': 'error', 'message': str(e)}), 400
+
+        if volume is None and ratio is None:
+            return jsonify({'status': 'error', 'message': 'volume 与 ratio 至少提供一个'}), 400
+
+        if price_type == 11 and (price is None or price <= 0):
+            return jsonify({'status': 'error',
+                            'message': '限价单(price_type=11)必须提供正数 price'}), 400
+
+        formatted = _format_stock_code_for_trade(stock_code)
+        logger.info(f"[外部卖出] {stock_code} -> {formatted}, volume={volume}, price={price}, ratio={ratio}, price_type={price_type}")
+        order_id = trading_strategy.manual_sell(
+            stock_code=formatted, volume=volume, price=price, ratio=ratio,
+            price_type=price_type)
+
+        if order_id:
+            return jsonify({
+                'status': 'success', 'order_id': order_id, 'stock_code': formatted,
+                'message': f'卖出指令已提交: {formatted}',
+            })
+        return jsonify({
+            'status': 'failed', 'order_id': None, 'stock_code': formatted,
+            'message': f'卖出未成功: {formatted}（原因见服务端日志：权限开关/持仓/交易时间等）',
+        })
+    except Exception as e:
+        logger.error(f"单只卖出操作出错: {str(e)}")
+        return jsonify({'status': 'error', 'message': f'卖出操作失败: {str(e)}'}), 500
+
+
+@app.route('/api/orders/cancel', methods=['POST'])
+@require_token
+def cancel_order():
+    """撤销指定委托。order_id 为委托号；stock_code 可选（仅用于日志定位）。
+
+    委托 position_manager._cancel_order（含 int 转换与 3 次重试）；
+    模拟模式无在途委托，撤单恒返回 failed 属预期。
+    """
+    try:
+        data = request.get_json(silent=True) or {}
+        raw_order_id = data.get('order_id')
+        if raw_order_id is None:
+            return jsonify({'status': 'error', 'message': 'order_id 不能为空'}), 400
+        try:
+            order_id = int(raw_order_id)
+        except (TypeError, ValueError):
+            return jsonify({'status': 'error', 'message': f'order_id 必须是整数: {raw_order_id!r}'}), 400
+
+        stock_code = str(data.get('stock_code') or '').strip()
+        position_manager = get_position_manager_instance()
+        ok = position_manager._cancel_order(stock_code or str(order_id), order_id)
+
+        if ok:
+            return jsonify({'status': 'success', 'message': f'撤单指令已提交: {order_id}'})
+        return jsonify({
+            'status': 'failed',
+            'message': f'撤单未成功: {order_id}（原因见服务端日志：QMT 连接/委托状态等）',
+        })
+    except Exception as e:
+        logger.error(f"撤单操作出错: {str(e)}")
+        return jsonify({'status': 'error', 'message': f'撤单操作失败: {str(e)}'}), 500
+
+
+@app.route('/api/account', methods=['GET'])
+@require_token
+def account_info():
+    """账户资产信息（总资产/可用资金/持仓市值），供交易面板账户条显示。
+
+    与 /api/status（运行开关状态）互补，本接口只返回资产维度。
+    """
+    try:
+        position_manager = get_position_manager_instance()
+        info = position_manager.get_account_info()
+        if not info:
+            return jsonify({'status': 'error', 'message': '账户信息不可用（QMT 未连接或尚未初始化）'}), 503
+        return jsonify({
+            'status': 'success',
+            'data': info,
+            'simulation_mode': bool(getattr(config, 'ENABLE_SIMULATION_MODE', False)),
+        })
+    except Exception as e:
+        logger.error(f"获取账户信息出错: {str(e)}")
+        return jsonify({'status': 'error', 'message': f'获取账户信息失败: {str(e)}'}), 500
+
+
 @app.route('/api/holdings/update', methods=['POST'])
 @require_token
 def update_holding_params():

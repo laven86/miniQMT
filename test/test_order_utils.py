@@ -71,6 +71,28 @@ class TestFormatOrderTime(unittest.TestCase):
         result = format_order_time(True)
         self.assertNotIn("1970", str(result))
 
+    # ---------- 大QMT RPC 柜台行的时间形态（2026-10-12 委托时间字段补齐） ----------
+
+    def test_compact_datetime_int(self):
+        self.assertEqual(format_order_time(20260801103000), "2026-08-01 10:30:00")
+
+    def test_hhmmss_int_uses_today(self):
+        expected = datetime.now().strftime("%Y-%m-%d ") + "09:30:01"
+        self.assertEqual(format_order_time(93001), expected)
+
+    def test_hhmmss_digit_string(self):
+        expected = datetime.now().strftime("%Y-%m-%d ") + "14:47:21"
+        self.assertEqual(format_order_time("144721"), expected)
+
+    def test_seconds_of_day_when_not_hhmmss(self):
+        # 69900 不是合法 HHMMSS（分位 99），按当日秒数解读为 19:25:00
+        expected = datetime.now().strftime("%Y-%m-%d ") + "19:25:00"
+        self.assertEqual(format_order_time(69900), expected)
+
+    def test_midrange_int_returns_none(self):
+        # 235959 与 1e9 之间无法归一（旧行为会给出 1970 年的乱值，宁可不给）
+        self.assertIsNone(format_order_time(300000))
+
 
 class TestOrderStatus(unittest.TestCase):
     def test_active_status_codes_are_pending(self):

@@ -1013,9 +1013,13 @@ class TradingStrategy:
                 logger.error(f"策略循环出错: {str(e)}")
                 time.sleep(60)  # 出错后等待一分钟再继续
     
-    def manual_buy(self, stock_code, volume=None, price=None, amount=None):
+    def manual_buy(self, stock_code, volume=None, price=None, amount=None, price_type=5):
         """
-        手动买入股票 - 不受ENABLE_AUTO_TRADING限制
+        手动买入股票 - 不受ENABLE_AUTO_TRADING限制。
+
+        price_type: QMT 报价类型，缺省 5（最新价，柜台忽略 price 按下单瞬间
+        最新价撮合）；11=限价（price 生效）；42-48=交易所原生市价类。
+        既有调用方（web1.0 备选池买入等）不传 → 默认 5，行为不变。
         """
         try:
             # 手动交易不检查ENABLE_AUTO_TRADING，但要检查ENABLE_ALLOW_BUY
@@ -1028,7 +1032,8 @@ class TradingStrategy:
             strategy = 'M_simu' if is_simulation else 'M_real'
 
             order_id = self.trading_executor.buy_stock(
-                stock_code, volume, price, amount, strategy=strategy
+                stock_code, volume, price, amount,
+                price_type=price_type, strategy=strategy
             )
             
             if order_id:
@@ -1040,9 +1045,12 @@ class TradingStrategy:
             logger.error(f"手动买入 {stock_code} 时出错: {str(e)}")
             return None
     
-    def manual_sell(self, stock_code, volume=None, price=None, ratio=None):
+    def manual_sell(self, stock_code, volume=None, price=None, ratio=None, price_type=5):
         """
-        手动卖出股票 - 不受ENABLE_AUTO_TRADING限制
+        手动卖出股票 - 不受ENABLE_AUTO_TRADING限制。
+
+        price_type 语义与 manual_buy 一致：缺省 5（最新价），11=限价，
+        42-48=交易所原生市价类。既有调用方不传 → 默认 5，行为不变。
         """
         try:
             # 手动交易不检查ENABLE_AUTO_TRADING，但要检查ENABLE_ALLOW_SELL
@@ -1055,7 +1063,8 @@ class TradingStrategy:
             strategy = 'manual_simu' if is_simulation else 'manual_real'
 
             order_id = self.trading_executor.sell_stock(
-                stock_code, volume, price, ratio, strategy=strategy
+                stock_code, volume, price, ratio,
+                price_type=price_type, strategy=strategy
             )
             
             if order_id:
