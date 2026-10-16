@@ -34,6 +34,18 @@ from order_utils import (
     status_desc as order_status_desc,
 )
 import utils
+from chan_order_gateway import build_gateway, order_row
+
+_chan_gateway = None
+_chan_gateway_lock = threading.RLock()
+
+
+def get_chan_gateway():
+    global _chan_gateway
+    with _chan_gateway_lock:
+        if _chan_gateway is None:
+            _chan_gateway = build_gateway(config, get_position_manager_instance, get_data_manager)
+        return _chan_gateway
 
 
 # 获取logger
@@ -604,6 +616,11 @@ def get_market_health():
 def get_positions():
     """获取持仓信息 - 增加版本号支持"""
     try:
+        if config.ENABLE_SIMULATION_MODE:
+            state = get_chan_gateway().state()
+            rows = [{'stock_code': p['symbol'], **p} for p in state['positions']]
+            return jsonify({'status': 'success', 'data': {'positions': rows, 'positions_all': rows},
+                            'data_version': int(time.time() * 1000), 'no_change': False})
         # 动态获取position_manager以确保grid_manager已初始化
         position_manager = get_position_manager_instance()
 
@@ -766,6 +783,12 @@ def get_orders():
     交易记录里还没有它，仅靠持仓和成交无法察觉。
     """
     try:
+        if config.ENABLE_SIMULATION_MODE:
+            rows = get_chan_gateway().state()['orders']
+            return jsonify({'status': 'success', 'data': [dict(row,
+                order_id=str(row['order_id']), is_pending=order_is_pending(row['status']),
+                stock_name=row['stock_code'], status_desc=order_status_desc(row['status']),
+                order_time=format_order_time(row['order_time'])) for row in rows if row.get('order_id') is not None]})
         position_manager = get_position_manager_instance()
         qmt_trader = getattr(position_manager, 'qmt_trader', None)
         if qmt_trader is None or getattr(qmt_trader, 'xt_trader', None) is None:
@@ -776,6 +799,8 @@ def get_orders():
 
         orders = []
         for order in (raw_orders or []):
+            client_id = order_row(order)['client_order_id']
+            display_id = getattr(order, 'order_id', '')
             status = getattr(order, 'order_status', 0)
             stock_code = getattr(order, 'stock_code', '') or ''
             try:
@@ -783,7 +808,7 @@ def get_orders():
             except Exception:
                 stock_name = stock_code
             orders.append({
-                'order_id': str(getattr(order, 'order_id', '') or ''),
+                'order_id': str(display_id or ''),
                 'stock_code': stock_code,
                 'stock_name': stock_name or stock_code,
                 'trade_type': 'BUY' if getattr(order, 'order_type', ORDER_TYPE_BUY) == ORDER_TYPE_BUY else 'SELL',
@@ -795,6 +820,8 @@ def get_orders():
                 'is_pending': order_is_pending(status),
                 'order_time': format_order_time(getattr(order, 'order_time', None)),
                 'strategy': getattr(order, 'strategy_name', '') or '',
+                'client_order_id': client_id,
+                'traded_price': getattr(order, 'traded_price', None),
             })
 
         sort_orders(orders)
@@ -1727,6 +1754,12 @@ def buy_single():
                             'message': '限价单(price_type=11)必须提供正数 price'}), 400
 
         formatted = _format_stock_code_for_trade(stock_code)
+        if data.get('client_order_id'):
+            try:
+                return jsonify(get_chan_gateway().submit({**data, 'stock_code': formatted,
+                    'volume': volume, 'price': price, 'price_type': price_type}, 'buy'))
+            except ValueError as exc:
+                return jsonify({'status': 'failed', 'message': str(exc)})
         logger.info(f"[外部买入] {stock_code} -> {formatted}, volume={volume}, price={price}, amount={amount}, price_type={price_type}")
         order_id = trading_strategy.manual_buy(
             stock_code=formatted, volume=volume, price=price, amount=amount,
@@ -1778,6 +1811,12 @@ def sell_single():
                             'message': '限价单(price_type=11)必须提供正数 price'}), 400
 
         formatted = _format_stock_code_for_trade(stock_code)
+        if data.get('client_order_id'):
+            try:
+                return jsonify(get_chan_gateway().submit({**data, 'stock_code': formatted,
+                    'volume': volume, 'price': price, 'price_type': price_type}, 'sell'))
+            except ValueError as exc:
+                return jsonify({'status': 'failed', 'message': str(exc)})
         logger.info(f"[外部卖出] {stock_code} -> {formatted}, volume={volume}, price={price}, ratio={ratio}, price_type={price_type}")
         order_id = trading_strategy.manual_sell(
             stock_code=formatted, volume=volume, price=price, ratio=ratio,
@@ -1810,6 +1849,15 @@ def cancel_order():
         raw_order_id = data.get('order_id')
         if raw_order_id is None:
             return jsonify({'status': 'error', 'message': 'order_id 不能为空'}), 400
+        expected = (data.get('account_id'), data.get('trading_mode'), data.get('channel'))
+        if any(value is not None for value in expected):
+            context = get_chan_gateway().context()
+            if expected != (context['account_id'], context['mode'], context['channel']):
+                return jsonify({'status': 'failed', 'message': '撤单账户、模式或通道已改变'})
+        if _chan_gateway is not None:
+            result = _chan_gateway.cancel(raw_order_id)
+            if result is not None:
+                return jsonify(result)
         try:
             order_id = int(raw_order_id)
         except (TypeError, ValueError):
@@ -1838,6 +1886,11 @@ def account_info():
     与 /api/status（运行开关状态）互补，本接口只返回资产维度。
     """
     try:
+        if config.ENABLE_SIMULATION_MODE:
+            state = get_chan_gateway().state()
+            return jsonify({'status': 'success', 'simulation_mode': True,
+                'data': {'account_id': state['account_id'], 'available': state['cash'],
+                         'market_value': None, 'total_asset': None}})
         position_manager = get_position_manager_instance()
         info = position_manager.get_account_info()
         if not info:
@@ -1850,6 +1903,27 @@ def account_info():
     except Exception as e:
         logger.error(f"获取账户信息出错: {str(e)}")
         return jsonify({'status': 'error', 'message': f'获取账户信息失败: {str(e)}'}), 500
+
+
+@app.route('/api/execution-state', methods=['GET'])
+@require_token
+def chan_execution_state():
+    try:
+        return jsonify({'status': 'success', 'data': get_chan_gateway().state(
+            request.args.get('symbols', '').split(','))})
+    except Exception as exc:
+        return jsonify({'status': 'error', 'message': str(exc)}), 503
+
+
+@app.route('/api/trading-rules', methods=['GET'])
+@require_token
+def chan_trading_rules():
+    try:
+        return jsonify({'status': 'success', 'data': get_chan_gateway().rules_provider(request.args.get('symbol', ''))})
+    except ValueError as exc:
+        return jsonify({'status': 'error', 'message': str(exc)}), 400
+    except Exception as exc:
+        return jsonify({'status': 'error', 'message': str(exc)}), 503
 
 
 @app.route('/api/holdings/update', methods=['POST'])

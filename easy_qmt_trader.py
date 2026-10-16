@@ -661,7 +661,8 @@ class easy_qmt_trader:
             logger.debug(f'查询资产回调结果={self.xt_trader.query_stock_asset_async(account=self.acc,callback=subscribe_result)}')
             #print(subscribe_result)
             stock_code = self.adjust_stock(stock=stock_code)
-            price=self.select_slippage(stock=stock_code,price=price,trader_type=order_type)
+            if price_type not in (11, 42, 43, 44, 45, 46, 47, 48):
+                price=self.select_slippage(stock=stock_code,price=price,trader_type=order_type)
             # 使用指定价下单，接口返回订单编号，后续可以用于撤单操作以及查询委托状态
             fix_result_order_id = self.xt_trader.order_stock(account=self.acc,stock_code=stock_code, order_type=order_type,
                                                             order_volume=order_volume, price_type=price_type,
@@ -679,7 +680,8 @@ class easy_qmt_trader:
         logger.debug(f'查询资产回调结果={self.xt_trader.query_stock_asset_async(account=self.acc,callback=subscribe_result)}')
         #print(subscribe_result)
         stock_code =self.adjust_stock(stock=security)
-        price=self.select_slippage(stock=security,price=price,trader_type='buy')
+        if price_type not in (11, 42, 43, 44, 45, 46, 47, 48):
+            price=self.select_slippage(stock=security,price=price,trader_type='buy')
         order_volume=amount
         # 根据配置选择同步或异步接口
         if order_volume>0:
@@ -711,7 +713,8 @@ class easy_qmt_trader:
         logger.debug(f'查询资产回调结果={self.xt_trader.query_stock_asset_async(account=self.acc,callback=subscribe_result)}')
         #print(subscribe_result)
         stock_code =self.adjust_stock(stock=security)
-        price=self.select_slippage(stock=security,price=price,trader_type='sell')
+        if price_type not in (11, 42, 43, 44, 45, 46, 47, 48):
+            price=self.select_slippage(stock=security,price=price,trader_type='sell')
         order_volume=amount
         # 根据配置选择同步或异步接口
         if order_volume>0:
@@ -753,7 +756,8 @@ class easy_qmt_trader:
         logger.debug(f'查询资产回调结果={self.xt_trader.query_stock_asset_async(account=self.acc,callback=subscribe_result)}')
         #print(subscribe_result)
         stock_code = self.adjust_stock(stock=stock_code)
-        price=self.select_slippage(stock=stock_code,price=price,trader_type=order_type)
+        if price_type not in (11, 42, 43, 44, 45, 46, 47, 48):
+            price=self.select_slippage(stock=stock_code,price=price,trader_type=order_type)
         # 使用指定价下单，接口返回订单编号，后续可以用于撤单操作以及查询委托状态
         fix_result_order_id = self.xt_trader.order_stock_async(account=self.acc,stock_code=stock_code, order_type=order_type,
                                                             order_volume=order_volume, price_type=price_type,

@@ -47,6 +47,9 @@ def _load_dotenv_fallback(path=None):
 
 _load_dotenv_fallback()
 
+CHAN_ORDER_DB_PATH = os.environ.get('CHAN_ORDER_DB_PATH', os.path.join(os.path.dirname(__file__), 'data', 'chan_orders.sqlite3'))
+CHAN_ORDER_FEE_BUFFER = .002
+
 # ======================= 系统配置 =======================
 # 调试开关
 DEBUG = False

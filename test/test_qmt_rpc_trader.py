@@ -170,6 +170,19 @@ class FakeRpcClient:
 # ---------------------------------------------------------------------------
 
 class QmtRpcTraderTest(unittest.TestCase):
+    def test_explicit_limit_and_market_protection_are_not_slipped(self):
+        t = self._make()
+        t.buy('600000.SH', amount=100, price=10.0, price_type=11)
+        t.sell('600000.SH', amount=100, price=8.0, price_type=42)
+        calls = [params for method, params in t._bq.client.calls if method == 'order_stock']
+        self.assertEqual([c['price'] for c in calls], [10.0, 8.0])
+
+    def test_missing_fill_price_and_status_are_unknown(self):
+        t = self._make()
+        order = t._bq_order_to_fake(base.FakeXtObject(price=10.0))
+        self.assertIsNone(order.traded_price)
+        self.assertEqual(order.order_status, -1)
+
     def _make(self, alive=True, allow_order=True, account="TESTACC"):
         t = QmtRpcTrader(account=account, account_type="STOCK")
         t._bq.client = FakeRpcClient(account_id=account, alive=alive)

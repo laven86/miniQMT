@@ -178,7 +178,7 @@ def trades_to_df(orders):
         '成交时间': getattr(o, 'order_time', 0),
         '成交均价': o.traded_price,
         '成交数量': o.traded_volume,
-        '成交金额': o.traded_price * o.traded_volume,
+        '成交金额': o.traded_price * o.traded_volume if o.traded_price is not None else None,
         '订单编号': o.order_id,
         '柜台合同编号': getattr(o, 'order_sysid', ''),
         '策略名称': getattr(o, 'strategy_name', ''),

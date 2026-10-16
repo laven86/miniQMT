@@ -244,6 +244,20 @@ class TestTraderCallback(TestBase):
     # Group A: Callback 链路完整性
     # ===================================================================
 
+    def test_async_limit_order_does_not_apply_slippage(self):
+        trader = easy_qmt_trader.__new__(easy_qmt_trader)
+        trader.xt_trader = MagicMock()
+        trader.acc = MagicMock()
+        trader.xt_trader.order_stock_async.return_value = 123
+        trader.adjust_stock = MagicMock(return_value='600000.SH')
+        trader.select_slippage = MagicMock(side_effect=AssertionError('limit order must not slip'))
+        result = trader.order_stock_async(
+            stock_code='600000.SH', order_volume=100, price_type=11, price=10.0,
+        )
+        self.assertEqual(result, 123)
+        trader.select_slippage.assert_not_called()
+        self.assertEqual(trader.xt_trader.order_stock_async.call_args.kwargs['price'], 10.0)
+
     def test_a1_on_stock_trade_notifies_all_callbacks(self):
         """on_stock_trade 应依次调用所有注册的外部回调"""
         cb_obj = MyXtQuantTraderCallback({})

@@ -367,7 +367,7 @@ class QmtRpcTrader:
             stock_code=getattr(o, 'stock_code', ''),
             traded_volume=volume,
             traded_price=getattr(o, 'traded_price', 0),
-            traded_amount=getattr(o, 'traded_price', 0) * volume,
+            traded_amount=(o.traded_price * volume if getattr(o, 'traded_price', None) is not None else None),
             account_id=self.account,
             account_type=self.account_type,
             traded_id=base_trade_id,
@@ -435,8 +435,8 @@ class QmtRpcTrader:
             price_type=50,
             price=getattr(order, 'price', 0),
             traded_volume=int(getattr(order, 'traded_volume', 0) or 0),
-            traded_price=getattr(order, 'price', 0),
-            order_status=int(getattr(order, 'order_status', 56) or 56),
+            traded_price=getattr(order, 'traded_price', None),
+            order_status=int(getattr(order, 'order_status', -1) if getattr(order, 'order_status', None) is not None else -1),
             status_msg='',
             strategy_name=str(getattr(order, 'strategy_name', '')),
             order_remark=str(getattr(order, 'order_remark', '')),
@@ -469,7 +469,8 @@ class QmtRpcTrader:
             return None
         try:
             code = base.adjust_stock(stock_code)
-            price = base.select_slippage(code, price or 0, action, self.slippage)
+            if price_type not in (11, 42, 43, 44, 45, 46, 47, 48):
+                price = base.select_slippage(code, price or 0, action, self.slippage)
             if price_type is not None:
                 pass  # 调用方显式指定
             elif price is None or price == 0:

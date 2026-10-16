@@ -513,6 +513,28 @@ class TestSystemStatus(WebAPITestBase):
 class TestPositions(WebAPITestBase):
     """测试持仓管理接口"""
 
+    def test_simulation_reads_initialize_gateway_before_fallback(self):
+        state = {
+            'account_id': 'SIM_TEST',
+            'cash': 1000,
+            'positions': [{'symbol': '510300.SH', 'volume': 100, 'available': 100}],
+            'orders': [{'order_id': 'SIM_1', 'stock_code': '510300.SH',
+                        'status': 50, 'order_time': 0}],
+        }
+        gateway = MagicMock()
+        gateway.state.return_value = state
+        with patch.object(config, 'ENABLE_SIMULATION_MODE', True), \
+             patch.object(web_server, '_chan_gateway', None), \
+             patch.object(web_server, 'get_chan_gateway', return_value=gateway):
+            positions = self.client.get('/api/positions').get_json()
+            orders = self.client.get('/api/orders').get_json()
+            account = self.client.get('/api/account').get_json()
+        self.assertEqual(positions['data']['positions'][0]['stock_code'], '510300.SH')
+        self.assertEqual(orders['data'][0]['order_id'], 'SIM_1')
+        self.assertTrue(account['simulation_mode'])
+        self.assertEqual(account['data']['account_id'], 'SIM_TEST')
+        self.assertEqual(gateway.state.call_count, 3)
+
     def test_01_get_positions_no_version(self):
         """GET /api/positions 无版本号时返回完整数据"""
         resp, ms = self._get('/api/positions')
