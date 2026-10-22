@@ -12,8 +12,9 @@ import time
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
+from contextlib import contextmanager
+from order_utils import ACTIVE_ORDER_STATUS as ACTIVE, parse_order_time
 
-ACTIVE = {48, 49, 50, 51, 52, 55}
 
 
 def rpc_position_rows(raw):
@@ -27,8 +28,17 @@ def rpc_position_rows(raw):
     return rows
 
 
+def is_etf(symbol):
+    code, market = symbol.upper().split('.')
+    return (market == 'SH' and code.startswith(('510', '511', '512', '513', '515', '516', '517', '518',
+            '560', '561', '562', '563', '565', '588', '589'))) or (market == 'SZ' and code.startswith('159'))
+
+
 def quantity_rules(symbol):
     code, market = symbol.split('.')
+    if is_etf(symbol):
+        return dict(buy_min=100, sell_min=100, buy_step=100, sell_step=100,
+                    buy_max=1000000, sell_max=1000000, tick_size=.001)
     if market == 'SH' and code.startswith(('688', '689')):
         return dict(buy_min=200, sell_min=200, buy_step=1, sell_step=1,
                     buy_max=100000, sell_max=50000, tick_size=.01)
@@ -42,7 +52,7 @@ def quantity_rules(symbol):
     if market == 'BJ' and code.startswith(('43', '83', '87', '92')):
         return dict(buy_min=100, sell_min=100, buy_step=1, sell_step=1,
                     buy_max=1000000, sell_max=1000000, tick_size=.01)
-    raise ValueError('首版仅支持已配置申报规则的A股股票，其他证券暂不可启用')
+    raise ValueError('仅支持已配置申报规则的A股股票及沪深ETF')
 
 
 def check_quantity(qty, rule, side, available=0):
@@ -64,12 +74,39 @@ def order_row(order):
             'stock_code': getattr(order, 'stock_code', ''),
             'trade_type': 'BUY' if getattr(order, 'order_type', 0) == 23 else 'SELL',
             'price': getattr(order, 'price', None),
+            'price_type': getattr(order, 'price_type', None),
             'traded_price': getattr(order, 'traded_price', None),
             'volume': int(getattr(order, 'order_volume', 0) or 0),
             'traded_volume': int(getattr(order, 'traded_volume', 0) or 0),
             'status': int(raw_status) if raw_status is not None else -1,
+            'status_msg': getattr(order, 'status_msg', '') or '',
             'strategy': strategy, 'client_order_id': match[1] if match else None,
+            'order_remark': remark,
             'order_time': getattr(order, 'order_time', None)}
+
+
+def _same_identity(own, row):
+    if str(row.get('stock_code') or '').upper() != str(own.get('stock_code') or '').upper():
+        return False
+    if str(row.get('trade_type') or '').upper() != str(own.get('trade_type') or '').upper():
+        return False
+    if int(row.get('volume') or 0) != int(own.get('volume') or 0):
+        return False
+    return True
+
+
+def _same_order_signature(own, row, window_seconds=300):
+    if not _same_identity(own, row):
+        return False
+    if own.get('price_type') == 5:
+        if row.get('price_type') != 5:
+            return False
+    elif (row.get('price_type') not in (None, own.get('price_type'))
+          or abs(float(row.get('price') or 0) - float(own.get('price') or 0)) > .000001):
+        return False
+    created = float(own.get('created_at') or 0)
+    accepted = row.get('broker_timestamp')
+    return bool(created and accepted is not None and abs(accepted - created) <= window_seconds)
 
 
 class ChanOrderGateway:
@@ -82,19 +119,42 @@ class ChanOrderGateway:
         self.seed_simulation, self.allowed, self.clock = seed_simulation, allowed, clock
         self.fee_buffer = fee_buffer
         self.lock = threading.RLock()
+        self._snapshot_lock = threading.Lock()
+        self._snapshot_generation = 0
+        self._snapshot_value = None
+        self._submitting = set()
+        self._resource_versions = {}
         with self._db() as db:
             db.executescript('''CREATE TABLE IF NOT EXISTS chan_orders(
                 id TEXT PRIMARY KEY, context TEXT NOT NULL, fingerprint TEXT NOT NULL, state TEXT NOT NULL);
-                CREATE TABLE IF NOT EXISTS chan_sim_accounts(context TEXT PRIMARY KEY, state TEXT NOT NULL);''')
+                CREATE TABLE IF NOT EXISTS chan_sim_accounts(context TEXT PRIMARY KEY, state TEXT NOT NULL);
+                CREATE INDEX IF NOT EXISTS idx_chan_orders_context ON chan_orders(context);''')
+            columns = {row[1] for row in db.execute('PRAGMA table_info(chan_orders)')}
+            if 'trading_day' not in columns:
+                db.execute('ALTER TABLE chan_orders ADD COLUMN trading_day TEXT')
+                for client_id, state in db.execute('SELECT id,state FROM chan_orders').fetchall():
+                    day = datetime.fromtimestamp(json.loads(state)['created_at']).date().isoformat()
+                    db.execute('UPDATE chan_orders SET trading_day=? WHERE id=?', (day, client_id))
+            db.execute('CREATE INDEX IF NOT EXISTS idx_chan_orders_day ON chan_orders(context,trading_day)')
 
+    @contextmanager
     def _db(self):
-        return sqlite3.connect(self.path, timeout=10)
+        db = sqlite3.connect(self.path, timeout=10)
+        try:
+            with db:
+                yield db
+        finally:
+            db.close()
 
     def _key(self):
         return json.dumps(self.context(), sort_keys=True)
 
-    def _orders(self, db, key):
-        return [json.loads(row[0]) for row in db.execute('SELECT state FROM chan_orders WHERE context=? ORDER BY rowid', (key,))]
+    def _orders(self, db, key, day=None):
+        sql, params = 'SELECT state FROM chan_orders WHERE context=?', [key]
+        if day:
+            sql += ' AND trading_day=?'
+            params.append(day)
+        return [json.loads(row[0]) for row in db.execute(sql + ' ORDER BY rowid', params)]
 
     @staticmethod
     def _save(db, order):
@@ -109,7 +169,23 @@ class ChanOrderGateway:
         db.execute('INSERT INTO chan_sim_accounts VALUES(?,?)', (key, json.dumps(state)))
         return state
 
-    def state(self, symbols=()):
+    def state(self):
+        ctx = self.context()
+        if ctx['mode'] != 'simulation':
+            generation = self._snapshot_generation
+            with self._snapshot_lock:
+                key = self._key()
+                if generation == self._snapshot_generation or not self._snapshot_value or self._snapshot_value[0] != key:
+                    snapshot = self.snapshot_provider()
+                    if self._key() != key:
+                        raise RuntimeError('交易上下文在查询期间改变')
+                    snapshot['orders'] = self.normalize_orders(snapshot['orders'])
+                    self._snapshot_value = (key, {**ctx, **snapshot})
+                    self._snapshot_generation += 1
+                return self._snapshot_value[1]
+        with self.lock, self._db() as db:
+            symbols = {o['stock_code'] for o in self._orders(db, self._key()) if o['status'] in ACTIVE}
+        ticks = {symbol: self.quote(symbol) or {} for symbol in symbols}
         with self.lock, self._db() as db:
             ctx, key = self.context(), self._key()
             own = self._orders(db, key)
@@ -127,7 +203,7 @@ class ChanOrderGateway:
                         order['status'] = 53 if order['traded_volume'] else 54
                         self._save(db, order)
                         continue
-                    tick = self.quote(order['stock_code']) or {}
+                    tick = ticks.get(order['stock_code'], {})
                     price, ts = tick.get('lastPrice'), tick.get('time')
                     if not price or not ts or not math.isfinite(price) or price <= 0:
                         continue
@@ -170,18 +246,78 @@ class ChanOrderGateway:
                               'available': max(0, p['available'] - sell_frozen.get(symbol, 0))}
                              for symbol, p in state['positions'].items() if p['volume']]
                 return {**ctx, 'cash': state['cash'] - buy_frozen, 'positions': positions, 'orders': own}
-            snapshot = self.snapshot_provider()
-            # A durable client tag survives RPC id remapping and process restarts.
-            for order in own:
-                matches = [r for r in snapshot['orders'] if r.get('client_order_id') == order['client_order_id']]
-                if len(matches) == 1:
-                    matches[0]['accepted_at'] = order['created_at']
-                    order.update(matches[0])
-                    order['submit_status'] = 'success'
+
+    def normalize_orders(self, rows):
+        """Attach durable Chan IDs to broker rows without guessing ambiguous matches."""
+        with self.lock, self._db() as db:
+            key = self._key()
+            today = datetime.fromtimestamp(self.clock()).date().isoformat()
+            own = self._orders(db, key, today)
+            result = [dict(row) for row in (rows or [])]
+            for row in result:
+                ts = parse_order_time(row.get('order_time'), today)
+                row['broker_timestamp'] = ts
+                row['trading_day'] = datetime.fromtimestamp(ts).date().isoformat() if ts is not None else today
+            matched_own, matched_rows = set(), set()
+
+            def attach(order, row, index):
+                original = dict(order)
+                client_id = order['client_order_id']
+                broker_id = row.get('order_id')
+                row['client_order_id'] = client_id
+                row['strategy'] = row.get('strategy') or order.get('strategy', '')
+                row['source'] = order.get('source')
+                row['source_levels'] = order.get('source_levels') or []
+                row['accepted_at'] = order.get('created_at')
+                for field in ('status', 'status_msg', 'traded_volume', 'traded_price', 'order_time', 'trading_day'):
+                    if field in row:
+                        order[field] = row[field]
+                order['order_id'] = broker_id
+                order['broker_confirmed'] = True
+                order['submit_status'] = 'success'
+                if order != original:
                     self._save(db, order)
-                elif not matches and order['status'] in (53, 54, 56, 57):
-                    snapshot['orders'].append(order)
-            return {**ctx, **snapshot}
+                matched_own.add(client_id)
+                matched_rows.add(index)
+
+            for order in own:
+                direct = [index for index, row in enumerate(result)
+                          if row.get('client_order_id') == order['client_order_id']
+                          and row['trading_day'] == today and _same_identity(order, row)]
+                if not direct and order.get('order_id') is not None:
+                    direct = [index for index, row in enumerate(result)
+                               if str(row.get('order_id')) == str(order.get('order_id'))
+                               and row.get('client_order_id') in (None, '', order['client_order_id'])
+                               and row['trading_day'] == today and _same_identity(order, row)]
+                if len(direct) == 1 and direct[0] not in matched_rows:
+                    attach(order, result[direct[0]], direct[0])
+
+            pending = [order for order in own if order['client_order_id'] not in matched_own
+                       and not order.get('broker_confirmed')]
+            candidates = {}
+            for order in pending:
+                eligible = [index for index, row in enumerate(result)
+                    if index not in matched_rows and not row.get('client_order_id')
+                    and row['trading_day'] == today and _same_identity(order, row)]
+                local_id = str(order.get('order_id') or '')
+                exact = [index for index in eligible
+                         if local_id.startswith('bq:') and result[index].get('order_remark') == local_id
+                         and result[index].get('order_id') is not None
+                         and not isinstance(result[index]['order_id'], bool)
+                         and str(result[index]['order_id']) not in ('', '0', '-1')
+                         and not str(result[index]['order_id']).startswith(('bq:', 'chan:'))]
+                candidates[order['client_order_id']] = exact or [
+                    index for index in eligible if _same_order_signature(order, result[index])]
+            reverse = {}
+            for client_id, indexes in candidates.items():
+                for index in indexes:
+                    reverse.setdefault(index, []).append(client_id)
+            for order in pending:
+                indexes = candidates[order['client_order_id']]
+                if len(indexes) == 1 and len(reverse.get(indexes[0], [])) == 1:
+                    attach(order, result[indexes[0]], indexes[0])
+
+            return result
 
     @staticmethod
     def response(order):
@@ -193,9 +329,25 @@ class ChanOrderGateway:
         client_id = payload.get('client_order_id', '')
         if not re.fullmatch('[a-f0-9]{32}', client_id):
             raise ValueError('client_order_id须为32位十六进制ID')
+        if side == 'sell' and (payload.get('price_type') != 5 or payload.get('price') != 0):
+            raise ValueError('策略卖出须使用最新价类型5，price须为0')
         fingerprint = json.dumps({'side': side, **payload}, sort_keys=True)
+        key = self._key()
+        resource = (key, side, payload['stock_code'] if side == 'sell' else '')
+        with self.lock, self._db() as db:
+            resource_version = self._resource_versions.get(resource, 0)
+            previous = db.execute('SELECT context,fingerprint,state FROM chan_orders WHERE id=?', (client_id,)).fetchone()
+            if previous:
+                if previous[:2] != (key, fingerprint):
+                    raise ValueError('提交ID不能复用于不同参数或账户模式')
+                return self.response(json.loads(previous[2]))
+        self.allowed(side)
+        state = self.state()
+        rule = self.rules_provider(payload['stock_code'])
+        tick = self.quote(payload['stock_code']) or {} if state['mode'] == 'live' and side == 'buy' and rule.get('requires_live_price_check') else {}
         with self.lock:
-            key = self._key()
+            if self._key() != key:
+                raise ValueError('交易上下文已改变，未发单')
             ctx = self.context()
             expected = (payload.get('account_id'), payload.get('trading_mode'), payload.get('channel'))
             if any(v is not None for v in expected) and expected != (ctx['account_id'], ctx['mode'], ctx['channel']):
@@ -206,13 +358,24 @@ class ChanOrderGateway:
                     if previous[:2] != (key, fingerprint):
                         raise ValueError('提交ID不能复用于不同参数或账户模式')
                     return self.response(json.loads(previous[2]))
-            self.allowed(side)
-            state = self.state([payload['stock_code']])
             with self._db() as db:
-                if any(o['stock_code'] == payload['stock_code'] and o.get('submit_status') == 'unknown'
-                       for o in self._orders(db, key)):
-                    raise ValueError('该标的存在提交结果未知的委托，请先对账')
-            rule = self.rules_provider(payload['stock_code'])
+                today = datetime.fromtimestamp(self.clock()).date().isoformat()
+                if self._resource_versions.get(resource, 0) != resource_version:
+                    raise ValueError('资源预检期间已有其他提交，请等待新的有效信号')
+                local = self._orders(db, key, today)
+                if any(o['stock_code'] == payload['stock_code']
+                       and o.get('plan_id') == payload.get('plan_id')
+                       and o.get('submit_status') == 'unknown'
+                       for o in local):
+                    raise ValueError('当前计划存在提交结果未知的委托，禁止重复提交')
+            reflected = {o.get('client_order_id') for o in state['orders']}
+            for other in local:
+                same_resource = other['trade_type'] == side.upper() and (side == 'buy' or other['stock_code'] == payload['stock_code'])
+                if not same_resource:
+                    continue
+                if other['client_order_id'] in self._submitting or (other.get('submit_status') == 'success'
+                        and other['status'] in ACTIVE and other['client_order_id'] not in reflected):
+                    raise ValueError('同类资金或股份预留尚未获柜台确认，暂不能再次提交')
             qty = payload.get('volume')
             position = next((p for p in state['positions'] if p['symbol'] == payload['stock_code']), {'available': 0})
             check_quantity(qty, rule, side, position['available'])
@@ -227,7 +390,6 @@ class ChanOrderGateway:
                 if state['mode'] == 'live' and rule.get('requires_live_price_check'):
                     if not rule.get('upper_limit') or not rule.get('lower_limit'):
                         raise ValueError('当日合法价格边界缺失，暂不支持该证券')
-                    tick = self.quote(payload['stock_code']) or {}
                     ts = tick.get('time') or 0
                     ts = ts / 1000 if ts > 1e11 else ts
                     asks = tick.get('askPrice') or []
@@ -236,24 +398,28 @@ class ChanOrderGateway:
                         raise ValueError('缺少有效实时卖一报价，不能完成限价预检')
                     # Conservative subset of the continuous-auction price cage;
                     # do not widen the user's frozen limit to make it acceptable.
-                    if price > ask * 1.02 + 1e-9:
+                    if rule.get('apply_stock_price_cage', True) and price > ask * 1.02 + 1e-9:
                         raise ValueError('买入限价高于当前卖一价2%，等待下一次有效触发')
                 for bound, sign in (('upper_limit', 1), ('lower_limit', -1)):
                     if rule.get(bound) and (price - rule[bound]) * sign > 1e-9:
                         raise ValueError('限价超出证券当日合法范围')
                 if price * qty * (1 + self.fee_buffer) > state['cash']:
                     raise ValueError('含费可用资金不足')
-            elif kind != 5 or price != 0:
-                raise ValueError('策略卖出须使用最新价类型5，price须为0')
             order = {'client_order_id': client_id, 'stock_code': payload['stock_code'],
                      'trade_type': side.upper(), 'price': price, 'price_type': kind,
                      'volume': qty, 'traded_volume': 0, 'traded_price': None,
                      'status': -1, 'submit_status': 'unknown', 'order_id': None,
                      'strategy': payload.get('strategy_id', ''), 'intent_id': payload.get('intent_id'),
+                     'plan_id': payload.get('plan_id'), 'source': payload.get('source'),
+                     'source_levels': payload.get('source_levels') or [],
                      'created_at': self.clock(), 'accepted_at': self.clock(), 'order_time': self.clock()}
             with self._db() as db:
-                db.execute('INSERT INTO chan_orders VALUES(?,?,?,?)', (client_id, key, fingerprint, json.dumps(order)))
-            # Persist intent before the irreversible network call; no retry here.
+                db.execute('INSERT INTO chan_orders(id,context,fingerprint,state,trading_day) VALUES(?,?,?,?,?)',
+                           (client_id, key, fingerprint, json.dumps(order), today))
+            self._submitting.add(client_id)
+            self._resource_versions[resource] = resource_version + 1
+        # The persisted request reserves resources before crossing the broker boundary.
+        try:
             if self._key() != key:
                 order.update(submit_status='failed', status=57, message='交易上下文已改变，未发单')
             elif state['mode'] == 'simulation':
@@ -267,14 +433,25 @@ class ChanOrderGateway:
                         order['message'] = '柜台提交结果未知，请通过备注关联查询，禁止重发'
                 except Exception as exc:
                     order['message'] = f'柜台提交结果未知: {exc}'
-            with self._db() as db:
-                self._save(db, order)
+            with self.lock, self._db() as db:
+                saved = json.loads(db.execute('SELECT state FROM chan_orders WHERE id=?', (client_id,)).fetchone()[0])
+                if saved.get('broker_confirmed'):
+                    order = saved
+                else:
+                    self._save(db, order)
             return self.response(order)
+        finally:
+            with self.lock:
+                self._submitting.discard(client_id)
 
     def cancel(self, order_id):
         with self.lock, self._db() as db:
             key, ctx = self._key(), self.context()
-            order = next((o for o in self._orders(db, key) if str(o.get('order_id')) == str(order_id)), None)
+            today = datetime.fromtimestamp(self.clock()).date().isoformat()
+            matches = [o for o in self._orders(db, key, today) if str(o.get('order_id')) == str(order_id)]
+            if len(matches) > 1:
+                return {'status': 'failed', 'message': '柜台委托号归属不唯一'}
+            order = matches[0] if matches else None
             if not order:
                 return None
             if order['status'] not in ACTIVE:
@@ -283,11 +460,13 @@ class ChanOrderGateway:
                 order['status'] = 53 if order['traded_volume'] else 54
                 self._save(db, order)
                 return {'status': 'success', 'message': '模拟撤单完成'}
-            try:
-                result = self.cancel_provider(order_id)
-                return {'status': 'success' if result == 0 else 'failed', 'message': '撤单申请已发送' if result == 0 else '柜台拒绝撤单'}
-            except Exception as exc:
-                return {'status': 'unknown', 'message': f'撤单结果未知: {exc}'}
+        try:
+            if self._key() != key:
+                return {'status': 'failed', 'message': '撤单上下文已改变'}
+            result = self.cancel_provider(order_id)
+            return {'status': 'success' if result == 0 else 'failed', 'message': '撤单申请已发送' if result == 0 else '柜台拒绝撤单'}
+        except Exception as exc:
+            return {'status': 'unknown', 'message': f'撤单结果未知: {exc}'}
 
 
 def build_gateway(config, position_manager, data_manager):
@@ -350,7 +529,7 @@ def build_gateway(config, position_manager, data_manager):
 
     def rules(symbol):
         rule = quantity_rules(symbol)
-        rule.update(requires_live_price_check=True)
+        rule.update(requires_live_price_check=True, apply_stock_price_cage=not is_etf(symbol))
         try:
             detail = data_manager().xt.get_instrument_detail(symbol) or {}
             rule['lower_limit'] = detail.get('DownStopPrice')

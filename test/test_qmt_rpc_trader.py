@@ -178,10 +178,18 @@ class QmtRpcTraderTest(unittest.TestCase):
         self.assertEqual([c['price'] for c in calls], [10.0, 8.0])
 
     def test_missing_fill_price_and_status_are_unknown(self):
+        from bigqmt_signal_trader.adapters.order_bigqmt import BigQmtOrderGateway
         t = self._make()
         order = t._bq_order_to_fake(base.FakeXtObject(price=10.0))
         self.assertIsNone(order.traded_price)
         self.assertEqual(order.order_status, -1)
+        self.assertIsNone(order.price_type)
+        typed = t._bq._order_from_dict('TESTACC', {'price_type': 5, 'price': 6.07})
+        self.assertEqual(t._bq_order_to_fake(typed).price_type, 5)
+        gateway = BigQmtOrderGateway(None, get_trade_detail_data_func=lambda *args: [
+            base.FakeXtObject(m_nPriceType=5, m_dLimitPrice=6.07)])
+        payload = vars(gateway.query_orders('TESTACC', '')[0])
+        self.assertEqual(t._bq_order_to_fake(t._bq._order_from_dict('TESTACC', payload)).price_type, 5)
 
     def _make(self, alive=True, allow_order=True, account="TESTACC"):
         t = QmtRpcTrader(account=account, account_type="STOCK")

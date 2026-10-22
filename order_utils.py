@@ -27,6 +27,48 @@ ORDER_TYPE_BUY = 23
 ORDER_TYPE_SELL = 24
 
 
+def parse_order_time(value, trading_day=None):
+    """Return a timestamp only when the broker time can be parsed reliably."""
+    day = trading_day or datetime.now().date()
+    if isinstance(day, str):
+        day = datetime.strptime(day, '%Y-%m-%d').date()
+    if isinstance(value, datetime):
+        return value.timestamp()
+    if value is None or isinstance(value, bool):
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        if text.replace('.', '', 1).isdigit():
+            number = float(text)
+            digits = str(int(number))
+            if len(digits) == 14 and digits[:2] in ('19', '20'):
+                return datetime.strptime(digits, '%Y%m%d%H%M%S').timestamp()
+            if number >= 1_000_000_000:
+                return datetime.fromtimestamp(number / 1000 if number >= 1e11 else number).timestamp()
+            if number <= 0:
+                return None
+            try:
+                parsed = datetime.strptime(digits.zfill(6), '%H%M%S')
+            except ValueError:
+                if number >= 86400:
+                    return None
+                from datetime import timedelta
+                return (datetime.combine(day, datetime.min.time()) + timedelta(seconds=number)).timestamp()
+            return datetime.combine(day, parsed.time()).timestamp()
+        normalized = text.replace('T', ' ')
+        for fmt in ('%Y-%m-%d %H:%M:%S.%f', '%Y-%m-%d %H:%M:%S', '%Y-%m-%d %H:%M', '%H:%M:%S'):
+            try:
+                parsed = datetime.strptime(normalized, fmt)
+                return (datetime.combine(day, parsed.time()) if fmt == '%H:%M:%S' else parsed).timestamp()
+            except ValueError:
+                continue
+    except (ValueError, OverflowError, OSError):
+        pass
+    return None
+
+
 def format_order_time(value):
     """格式化委托时间为 'YYYY-MM-DD HH:MM:SS'。
 
@@ -36,53 +78,10 @@ def format_order_time(value):
     日期一律取今天）。同时兼容已经是字符串/datetime 的情形。
     无法解析时返回 None。
     """
-    if value is None:
-        return None
-
-    if isinstance(value, datetime):
-        return value.strftime('%Y-%m-%d %H:%M:%S')
-
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        if value <= 0:
-            return None
-        try:
-            digits = str(int(value))
-            if len(digits) == 14 and digits[:2] in ('19', '20'):
-                # 紧凑日期时间 YYYYMMDDHHMMSS
-                return datetime.strptime(
-                    digits, '%Y%m%d%H%M%S').strftime('%Y-%m-%d %H:%M:%S')
-            if value >= 1_000_000_000:
-                # Unix 秒级时间戳
-                return datetime.fromtimestamp(value).strftime('%Y-%m-%d %H:%M:%S')
-            if value <= 235_959:
-                # HHMMSS 小整数（93001 -> 09:30:01）；非法形态再按当日秒数解读
-                try:
-                    parsed = datetime.strptime('%06d' % int(value), '%H%M%S')
-                    return datetime.now().strftime('%Y-%m-%d ') + parsed.strftime('%H:%M:%S')
-                except ValueError:
-                    pass
-                if value <= 86_400:
-                    h, rem = divmod(int(value), 3600)
-                    m, s = divmod(rem, 60)
-                    return datetime.now().strftime('%Y-%m-%d ') + '%02d:%02d:%02d' % (h, m, s)
-            return None
-        except (ValueError, OSError, OverflowError):
-            return None
-
-    text = str(value).strip()
-    if not text:
-        return None
-    # 纯数字字符串同样按时间戳处理
-    if text.isdigit():
-        return format_order_time(int(text))
-
-    normalized = text.replace('T', ' ')
-    for fmt in ('%Y-%m-%d %H:%M:%S.%f', '%Y-%m-%d %H:%M:%S', '%Y-%m-%d %H:%M'):
-        try:
-            return datetime.strptime(normalized, fmt).strftime('%Y-%m-%d %H:%M:%S')
-        except ValueError:
-            pass
-    return text
+    timestamp = parse_order_time(value)
+    if timestamp is not None:
+        return datetime.fromtimestamp(timestamp).strftime('%Y-%m-%d %H:%M:%S')
+    return str(value).strip() or None if isinstance(value, str) and not value.strip().isdigit() else None
 
 
 def is_pending(status):

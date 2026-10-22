@@ -785,43 +785,42 @@ def get_orders():
     try:
         if config.ENABLE_SIMULATION_MODE:
             rows = get_chan_gateway().state()['orders']
-            return jsonify({'status': 'success', 'data': [dict(row,
-                order_id=str(row['order_id']), is_pending=order_is_pending(row['status']),
-                stock_name=row['stock_code'], status_desc=order_status_desc(row['status']),
-                order_time=format_order_time(row['order_time'])) for row in rows if row.get('order_id') is not None]})
-        position_manager = get_position_manager_instance()
-        qmt_trader = getattr(position_manager, 'qmt_trader', None)
-        if qmt_trader is None or getattr(qmt_trader, 'xt_trader', None) is None:
-            return jsonify({'status': 'success', 'data': []})
-
-        raw_orders = qmt_trader.xt_trader.query_stock_orders(qmt_trader.acc, cancelable_only=False)
-        data_manager = get_data_manager()
+            data_manager = None
+        else:
+            position_manager = get_position_manager_instance()
+            qmt_trader = getattr(position_manager, 'qmt_trader', None)
+            if qmt_trader is None or getattr(qmt_trader, 'xt_trader', None) is None:
+                return jsonify({'status': 'success', 'data': []})
+            raw_orders = qmt_trader.xt_trader.query_stock_orders(qmt_trader.acc, cancelable_only=False)
+            rows = get_chan_gateway().normalize_orders([order_row(order) for order in (raw_orders or [])])
+            data_manager = get_data_manager()
 
         orders = []
-        for order in (raw_orders or []):
-            client_id = order_row(order)['client_order_id']
-            display_id = getattr(order, 'order_id', '')
-            status = getattr(order, 'order_status', 0)
-            stock_code = getattr(order, 'stock_code', '') or ''
+        for row in rows:
+            stock_code = row.get('stock_code', '') or ''
             try:
-                stock_name = data_manager.get_stock_name(stock_code, allow_qmt_lookup=False)
+                stock_name = (data_manager.get_stock_name(stock_code, allow_qmt_lookup=False)
+                              if data_manager else stock_code)
             except Exception:
                 stock_name = stock_code
             orders.append({
-                'order_id': str(display_id or ''),
+                'order_id': str(row.get('order_id') or ''),
                 'stock_code': stock_code,
                 'stock_name': stock_name or stock_code,
-                'trade_type': 'BUY' if getattr(order, 'order_type', ORDER_TYPE_BUY) == ORDER_TYPE_BUY else 'SELL',
-                'price': getattr(order, 'price', 0) or 0,
-                'volume': getattr(order, 'order_volume', 0) or 0,
-                'traded_volume': getattr(order, 'traded_volume', 0) or 0,
-                'status': status,
-                'status_desc': order_status_desc(status, getattr(order, 'status_msg', '')),
-                'is_pending': order_is_pending(status),
-                'order_time': format_order_time(getattr(order, 'order_time', None)),
-                'strategy': getattr(order, 'strategy_name', '') or '',
-                'client_order_id': client_id,
-                'traded_price': getattr(order, 'traded_price', None),
+                'trade_type': row.get('trade_type'),
+                'price': row.get('price') or 0,
+                'volume': row.get('volume') or 0,
+                'traded_volume': row.get('traded_volume') or 0,
+                'status': row.get('status', 0),
+                'status_desc': order_status_desc(row.get('status', 0), row.get('status_msg', '')),
+                'is_pending': order_is_pending(row.get('status', 0)),
+                'order_time': format_order_time(row.get('order_time')),
+                'strategy': row.get('strategy') or '',
+                'client_order_id': row.get('client_order_id'),
+                'source': row.get('source'),
+                'source_levels': row.get('source_levels') or [],
+                'trading_day': row.get('trading_day'),
+                'traded_price': row.get('traded_price'),
             })
 
         sort_orders(orders)
@@ -1679,6 +1678,14 @@ def _format_stock_code_for_trade(stock):
     return code
 
 
+def _format_strategy_stock_code_for_trade(stock):
+    '''Chan execution requires an explicit market suffix in every mode.'''
+    code = Methods.add_xt_suffix(stock)
+    if not str(code or '').endswith(('.SH', '.SZ', '.BJ')):
+        raise ValueError(f'cannot determine stock market: {stock!r}')
+    return code
+
+
 def _coerce_trade_number(value, field, as_int=False):
     """外部 JSON 数值参数规整：None 透传，其余转 float（as_int 时须为整数值）。
     布尔 / NaN / inf / 非整数浮点一律 ValueError（由调用方返回 400），
@@ -1756,7 +1763,8 @@ def buy_single():
         formatted = _format_stock_code_for_trade(stock_code)
         if data.get('client_order_id'):
             try:
-                return jsonify(get_chan_gateway().submit({**data, 'stock_code': formatted,
+                strategy_code = _format_strategy_stock_code_for_trade(stock_code)
+                return jsonify(get_chan_gateway().submit({**data, 'stock_code': strategy_code,
                     'volume': volume, 'price': price, 'price_type': price_type}, 'buy'))
             except ValueError as exc:
                 return jsonify({'status': 'failed', 'message': str(exc)})
@@ -1813,7 +1821,8 @@ def sell_single():
         formatted = _format_stock_code_for_trade(stock_code)
         if data.get('client_order_id'):
             try:
-                return jsonify(get_chan_gateway().submit({**data, 'stock_code': formatted,
+                strategy_code = _format_strategy_stock_code_for_trade(stock_code)
+                return jsonify(get_chan_gateway().submit({**data, 'stock_code': strategy_code,
                     'volume': volume, 'price': price, 'price_type': price_type}, 'sell'))
             except ValueError as exc:
                 return jsonify({'status': 'failed', 'message': str(exc)})
@@ -1842,7 +1851,7 @@ def cancel_order():
     """撤销指定委托。order_id 为委托号；stock_code 可选（仅用于日志定位）。
 
     委托 position_manager._cancel_order（含 int 转换与 3 次重试）；
-    模拟模式无在途委托，撤单恒返回 failed 属预期。
+    策略委托优先通过网关撤销，其他委托沿用原手动撤单入口。
     """
     try:
         data = request.get_json(silent=True) or {}
@@ -1909,8 +1918,7 @@ def account_info():
 @require_token
 def chan_execution_state():
     try:
-        return jsonify({'status': 'success', 'data': get_chan_gateway().state(
-            request.args.get('symbols', '').split(','))})
+        return jsonify({'status': 'success', 'data': get_chan_gateway().state()})
     except Exception as exc:
         return jsonify({'status': 'error', 'message': str(exc)}), 503
 

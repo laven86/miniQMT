@@ -1605,6 +1605,7 @@ class BigQmtXtTrader:
             order_volume=_safe_int(item.get("volume", item.get("order_volume"))),
             traded_volume=_safe_int(item.get("traded_volume")),
             price=_safe_float(item.get("price")),
+            price_type=_safe_int(item.get("price_type")) if item.get("price_type") is not None else None,
             order_sysid=order_sysid,
             order_id=order_sysid or str(item.get("user_order_id") or ""),
             strategy_name=str(item.get("strategy_name") or ""),

@@ -432,7 +432,7 @@ class QmtRpcTrader:
             order_time=getattr(order, 'order_time', None),
             order_type=getattr(order, 'order_type', base.STOCK_BUY),
             order_volume=int(getattr(order, 'order_volume', 0) or 0),
-            price_type=50,
+            price_type=getattr(order, 'price_type', None),
             price=getattr(order, 'price', 0),
             traded_volume=int(getattr(order, 'traded_volume', 0) or 0),
             traded_price=getattr(order, 'traded_price', None),

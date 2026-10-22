@@ -232,6 +232,7 @@ class OrderSnapshot:
         strategy_name="",
         remark="",
         order_time="",
+        price_type=None,
     ):
         self.order_sys_id = order_sys_id
         self.user_order_id = user_order_id
@@ -244,6 +245,7 @@ class OrderSnapshot:
         self.strategy_name = strategy_name
         self.remark = remark
         self.order_time = order_time
+        self.price_type = price_type
 
 
 class TradeSnapshot:

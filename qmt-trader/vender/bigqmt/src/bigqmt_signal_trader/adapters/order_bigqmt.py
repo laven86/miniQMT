@@ -4,6 +4,7 @@ The passorder signature follows src/api/qmt_jq_trade.
 """
 
 import hashlib
+import re
 
 from ..code_utils import normalize_stock_code
 from ..models import CancelResult, OrderSnapshot, OrderSubmitResult, SignalAction, TradeSnapshot
@@ -88,7 +89,8 @@ class BigQmtOrderGateway:
         else:
             raise ValueError("unsupported order action: %s" % request.action)
 
-        user_order_id = self.build_user_order_id(request.signal_id)
+        user_order_id = (request.remark if re.fullmatch(r"chan:[a-f0-9]{32}", request.remark or "")
+                         else self.build_user_order_id(request.signal_id))
         account_id = request.account_id or self.account_id
         passorder(
             op_type,
@@ -138,6 +140,7 @@ class BigQmtOrderGateway:
                     traded_volume=int(_attr(row, ("m_nVolumeTraded", "traded_volume"), 0) or 0),
                     status=str(_attr(row, ("m_nOrderStatus", "status"), "") or ""),
                     price=float(_attr(row, ("m_dLimitPrice", "m_dPrice", "price"), 0.0) or 0.0),
+                    price_type=_attr(row, ("m_nPriceType", "price_type"), None),
                     strategy_name=str(_attr(row, ("m_strStrategyName", "strategy_name"), "") or ""),
                     remark=str(_attr(row, ("m_strRemark", "remark"), "") or ""),
                     # 委托时间：大QMT get_trade_detail_data 的 ORDER 行时间字段名无
