@@ -49,6 +49,31 @@ except Exception:
     logger = logging.getLogger("qmt_rpc_trader")
 
 
+def _build_rpc_redis_client(redis_config, timeout_seconds):
+    """构造 RPC 用 Redis 客户端：socket 超时长于 blpop 等待，且关闭自动重试。
+
+    call_redis_rpc 的 blpop 等待 ceil(timeout_seconds) 秒（vendored get_full_tick
+    全市场查询固定 30 秒），socket_timeout 取二者较大值再留 3 秒余量，保证 blpop
+    先返回空、由上层抛 rpc timeout，而不是套接字先超时。
+    """
+    import redis
+    from redis.backoff import NoBackoff
+    from redis.retry import Retry
+
+    cfg = dict(redis_config or {})
+    if not cfg.get("username"):
+        cfg.pop("username", None)
+    if not cfg.get("password"):
+        cfg.pop("password", None)
+    wait_seconds = max(30, int(float(timeout_seconds) + 0.999))
+    return redis.Redis(
+        socket_connect_timeout=2.0,
+        socket_timeout=wait_seconds + 3.0,
+        retry=Retry(NoBackoff(), 0),
+        **cfg
+    )
+
+
 class _FakeXtTrader:
     """
     模拟 easy_qmt_trader.xt_trader（XtQuantTrader）底层对象。
@@ -125,6 +150,10 @@ class QmtRpcTrader:
             path=path, session_id=self.session_id, account_id=self.account,
             redis_config=redis_cfg, timeout_seconds=timeout,
         )
+        # 替换 vendored 默认 redis.Redis：默认 socket_timeout=5 短于 RPC blpop
+        # 的等待时长，套接字先超时后 redis-py 8 默认 Retry 再重试 10 次并退避，
+        # 一次 6 秒的 ping 会被放大到约 58 秒。
+        self._bq.client.redis_client = _build_rpc_redis_client(self._bq.client.redis_config, timeout)
         self._bq_acc = StockAccount(self.account, account_type)
 
         # 兼容 easy_qmt_trader 的属性（position_manager 直接访问）

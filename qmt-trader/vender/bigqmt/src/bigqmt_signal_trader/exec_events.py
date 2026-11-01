@@ -115,7 +115,10 @@ def normalize_trade_event(trade, account_id=""):
 def _publish(redis_client, channel, event, maxlen=2000):
     raw = json.dumps(event, ensure_ascii=False, default=str)
     try:
-        redis_client.xadd(channel, {"payload": raw}, maxlen=maxlen, approximate=True)
+        # The relay client only supports plain XADD (no trimming). Skip the
+        # stream there; the pub/sub publish below is what clients consume.
+        if getattr(redis_client, "supports_xadd_maxlen", True):
+            redis_client.xadd(channel, {"payload": raw}, maxlen=maxlen, approximate=True)
     except Exception:
         pass
     redis_client.publish(channel, raw)

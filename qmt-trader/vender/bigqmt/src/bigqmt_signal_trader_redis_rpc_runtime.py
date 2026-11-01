@@ -50,6 +50,17 @@ REDIS_PORT = 6379
 REDIS_DB = 5
 REDIS_USERNAME = ""
 REDIS_PASSWORD = ""
+# File bridge mode: since the broker's 2026-10-23 upgrade Big QMT kills the
+# strategy for ANY outbound TCP connection (even 127.0.0.1 loopback, logged
+# as onIllegalIPFind "illegal IP"), so direct Redis AND the old TCP relay are
+# both dead (the relay adapter was deleted 2026-10-31; legacy relay_* keys in
+# the local config are ignored). When FILE_DIR is set, the strategy exchanges
+# JSON request and response files with the qmt_file_relay daemon under that
+# directory - zero sockets. FILE_DIR must match the daemon's --dir; FILE_TOKEN
+# must match its --token.
+FILE_DIR = ""
+FILE_TOKEN = ""
+FILE_TIMEOUT = 1.5
 RPC_ALLOW_ORDER_METHODS = False
 RPC_PROCESS_IN_LISTENER = True
 RPC_BACKGROUND_THREADS = False
@@ -106,6 +117,9 @@ REDIS_PORT = int(BIGQMT_REDIS_CONFIG.get("port", REDIS_PORT))
 REDIS_DB = int(BIGQMT_REDIS_CONFIG.get("db", REDIS_DB))
 REDIS_USERNAME = BIGQMT_REDIS_CONFIG.get("username", REDIS_USERNAME)
 REDIS_PASSWORD = BIGQMT_REDIS_CONFIG.get("password", REDIS_PASSWORD)
+FILE_DIR = str(BIGQMT_REDIS_CONFIG.get("file_dir", FILE_DIR) or "")
+FILE_TOKEN = str(BIGQMT_REDIS_CONFIG.get("file_token", FILE_TOKEN) or "")
+FILE_TIMEOUT = float(BIGQMT_REDIS_CONFIG.get("file_timeout", FILE_TIMEOUT))
 RPC_ALLOW_ORDER_METHODS = bool(BIGQMT_REDIS_CONFIG.get("rpc_allow_order_methods", RPC_ALLOW_ORDER_METHODS))
 RPC_PROCESS_IN_LISTENER = bool(
     BIGQMT_REDIS_CONFIG.get("rpc_process_in_listener", RPC_PROCESS_IN_LISTENER and not RPC_ALLOW_ORDER_METHODS)
@@ -159,6 +173,9 @@ def _apply_config(account_id):
             "db": REDIS_DB,
             "username": REDIS_USERNAME,
             "password": REDIS_PASSWORD,
+            "file_dir": FILE_DIR,
+            "file_token": FILE_TOKEN,
+            "file_timeout": FILE_TIMEOUT,
             "position_key_template": "bigqmt:positions:{account_id}",
             "position_event_stream_template": "bigqmt:position_events:{account_id}",
         },
@@ -209,13 +226,26 @@ def configure_runtime_account(account_id):
 
 
 def configure_runtime_redis(redis_config):
-    global REDIS_HOST, REDIS_PORT, REDIS_DB, REDIS_USERNAME, REDIS_PASSWORD, RPC_ALLOW_ORDER_METHODS, RPC_PROCESS_IN_LISTENER, RPC_BACKGROUND_THREADS, RPC_LISTENER_METHODS, SCHEDULE_ADJUST_ENABLED, SCHEDULE_ADJUST_INTERVAL, FULL_TICK_CACHE_ENABLED, FULL_TICK_DEMAND_TTL_SECONDS, FULL_TICK_CACHE_TTL_SECONDS, FULL_TICK_REFRESH_INTERVAL_SECONDS, FULL_TICK_MARKET_REFRESH_INTERVAL_SECONDS, FULL_TICK_REFRESH_MAX_WALL_SECONDS, FULL_TICK_MAX_REQUESTS, RPC_TRANSPORT, RPC_ZMQ_CONFIG, RPC_MYSQL_CONFIG, DOWNLOAD_JOBS_ENABLED, DOWNLOAD_JOB_CHUNK_SIZE, DOWNLOAD_JOB_MAX_WALL_SECONDS, DOWNLOAD_JOB_TTL_SECONDS, EXEC_EVENTS_ENABLED
+    global REDIS_HOST, REDIS_PORT, REDIS_DB, REDIS_USERNAME, REDIS_PASSWORD, FILE_DIR, FILE_TOKEN, FILE_TIMEOUT, RPC_ALLOW_ORDER_METHODS, RPC_PROCESS_IN_LISTENER, RPC_BACKGROUND_THREADS, RPC_LISTENER_METHODS, SCHEDULE_ADJUST_ENABLED, SCHEDULE_ADJUST_INTERVAL, FULL_TICK_CACHE_ENABLED, FULL_TICK_DEMAND_TTL_SECONDS, FULL_TICK_CACHE_TTL_SECONDS, FULL_TICK_REFRESH_INTERVAL_SECONDS, FULL_TICK_MARKET_REFRESH_INTERVAL_SECONDS, FULL_TICK_REFRESH_MAX_WALL_SECONDS, FULL_TICK_MAX_REQUESTS, RPC_TRANSPORT, RPC_ZMQ_CONFIG, RPC_MYSQL_CONFIG, DOWNLOAD_JOBS_ENABLED, DOWNLOAD_JOB_CHUNK_SIZE, DOWNLOAD_JOB_MAX_WALL_SECONDS, DOWNLOAD_JOB_TTL_SECONDS, EXEC_EVENTS_ENABLED
     redis_config = dict(redis_config or {})
     REDIS_HOST = redis_config.get("host", REDIS_HOST)
     REDIS_PORT = int(redis_config.get("port", REDIS_PORT))
     REDIS_DB = int(redis_config.get("db", REDIS_DB))
     REDIS_USERNAME = redis_config.get("username", REDIS_USERNAME)
     REDIS_PASSWORD = redis_config.get("password", REDIS_PASSWORD)
+    # Mode keys use SNAPSHOT semantics: a key missing from the passed
+    # config must CLEAR the value, not keep the module-level one. The
+    # module-level values above were loaded from a possibly stale cached
+    # import of bigqmt_signal_trader_local_config (BIGQMT_REDIS_DRYRUN
+    # reloads this module BEFORE reloading local_config), so
+    # get(key, old_value) would resurrect a deleted key. Callers always
+    # pass the full BIGQMT_REDIS_CONFIG dict, so treating it as
+    # authoritative is safe. Historic case (2026-10-31, relay deleted since):
+    # probe phase3 ping OK while DRYRUN died with RelayTimeoutError on
+    # 127.0.0.1:51761 because local_config had relay_* but no file_dir.
+    FILE_DIR = str(redis_config.get("file_dir") or "")
+    FILE_TOKEN = str(redis_config.get("file_token") or "")
+    FILE_TIMEOUT = float(redis_config.get("file_timeout") or 1.5)
     RPC_ALLOW_ORDER_METHODS = bool(redis_config.get("rpc_allow_order_methods", RPC_ALLOW_ORDER_METHODS))
     RPC_PROCESS_IN_LISTENER = bool(
         redis_config.get("rpc_process_in_listener", RPC_PROCESS_IN_LISTENER and not RPC_ALLOW_ORDER_METHODS)

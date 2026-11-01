@@ -443,6 +443,29 @@ QMT_RPC_DEAL_POLL_INTERVAL = 1.0
 # 下单二次确认开关：False 时即使 ENABLE_QMT_RPC_FALLBACK=True 也拒绝真实下单（只读安全）
 QMT_RPC_ALLOW_ORDER = _env_bool("QMT_RPC_ALLOW_ORDER", True)
 
+# ======================= 大QMT文件桥（FileRelayDaemon 集成） =======================
+# 2026-10-23 券商升级后沙箱封禁大QMT策略进程一切 TCP 外连（含回环），文件桥成为
+# 唯一可用通道（详见 qmt-trader/大QMT文件桥通道方案.md）。桥守护进程可嵌入
+# main.py 作为守护线程运行（start_file_bridge_thread），也可独立 CLI 运行
+# （python qmt-trader/qmt_file_relay.py，排障用）。
+# True（默认）：启动 main.py 时自动嵌入文件桥守护线程，无需单独窗口
+# False：不嵌入（需独立跑 qmt_file_relay.py，或根本不启用桥）
+ENABLE_QMT_FILE_BRIDGE = _env_bool("ENABLE_QMT_FILE_BRIDGE", True)
+# 文件交换目录：必须与桥（独立模式的 --dir）及大QMT侧 local_config 的 file_dir 一致；
+# 默认与 qmt_file_relay.py 的 DEFAULT_DIR 相同（qmt-trader/qmt_file_bridge）
+QMT_FILE_DIR = os.environ.get(
+    "QMT_FILE_DIR",
+    os.path.join(os.path.dirname(__file__), "qmt-trader", "qmt_file_bridge"),
+)
+# 共享鉴权 token：须与大QMT侧 local_config 的 file_token 一致；
+# 空（默认）表示双向都不校验 token
+QMT_FILE_TOKEN = os.environ.get("QMT_FILE_TOKEN", "")
+# 允许的 Redis key 前缀（桥只放行该前缀下的 key，与策略侧协议一致）
+QMT_FILE_KEY_PREFIX = os.environ.get("QMT_FILE_KEY_PREFIX", "bigqmt:")
+# 桥轮询 req/ 目录的空转间隔（秒）；处理完一批立即再扫
+QMT_FILE_POLL_INTERVAL = float(os.environ.get("QMT_FILE_POLL_INTERVAL", "0.002"))
+# 注：桥的 Redis 连接复用上方 QMT_RPC_REDIS（host/port/db/password），不单独配置
+
 # ======================= 策略配置 =======================
 # 仓位管理
 POSITION_UNIT = 35000  # 每次买入金额

@@ -123,3 +123,6 @@ dummy/
 
 # 交割单导出产物（含账号级财务数据，绝不入库）
 export/
+
+# qmt_file_relay file bridge runtime dir (req/resp/lock/probe leftovers)
+qmt-trader/qmt_file_bridge/

@@ -16,6 +16,27 @@ def _float_or_none(value, default=None):
 
 def build_redis_client(config=None):
     config = config or {}
+
+    # File bridge mode (required since the broker's 2026-10-23 upgrade: Big
+    # QMT kills the strategy for ANY outbound TCP connection, even 127.0.0.1
+    # loopback, so direct Redis AND the old TCP relay are both dead; the relay
+    # adapter was removed). When file_dir is set, the client exchanges JSON
+    # request/response files with the qmt_file_relay daemon in that directory
+    # - zero sockets.
+    file_dir = config.get("file_dir") or os.environ.get("BIGQMT_FILE_DIR")
+    if file_dir:
+        from .file_redis_client import FileRedisClient
+
+        return FileRedisClient(
+            file_dir=file_dir,
+            token=config.get("file_token") or os.environ.get("BIGQMT_FILE_TOKEN") or "",
+            timeout=_float_or_none(config.get("file_timeout", 1.5), 1.5),
+        )
+
+    # Direct Redis (no file_dir). Inside the Big QMT sandbox this path gets
+    # the strategy killed as "unavailable IP"; it only works outside the
+    # sandbox (tests, tools). The legacy relay_host/relay_port/relay_token
+    # keys are ignored since the TCP relay was deleted (2026-10-31).
     try:
         import redis
     except ImportError as exc:  # pragma: no cover

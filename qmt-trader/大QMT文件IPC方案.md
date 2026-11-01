@@ -1,5 +1,11 @@
 # 大QMT文件IPC方案 —— xttrader 降级替代
 
+> ⚠️ **已废弃（历史文档，2026-10-31 标注）**：本方案从未实盘启用，已被**大QMT文件桥通道方案**
+> （见 `大QMT文件桥通道方案.md`）取代——文件桥同样是文件交换思路，但走 req/resp JSON 帧
+> + FileRelayDaemon 桥接 Redis，已实盘验证通过。部署/排障以 `大QMT-RPC联调checklist.md`
+> 为准。本文仅供历史参考；对应实现（QMT_trade_executor.py / qmt_ipc_trader.py）与
+> `ENABLE_QMT_IPC_FALLBACK` 开关（默认 False）保留不动，勿在新部署中启用。
+
 > 当券商收紧 miniQMT 权限后，用大QMT内置 Python + 文件系统进程间通信（IPC）替代 xttrader 的完整方案。
 > 策略端跑在自己的量化程序里，通过 JSON 文件告诉大QMT"买什么、卖什么"，大QMT负责执行。
 

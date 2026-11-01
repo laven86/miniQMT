@@ -51,6 +51,115 @@ def _setup_window_and_pid():
 _setup_window_and_pid()
 
 from logger import get_logger, schedule_log_cleanup, clean_old_logs
+
+# 获取logger
+logger = get_logger("main")
+
+# 全局变量（threads 须先于文件桥定义：桥启动时登记自己的停止函数）
+threads = []
+
+
+def start_file_bridge_thread():
+    """启动大QMT文件桥守护线程（FileRelayDaemon 嵌入本进程）。
+
+    沙箱封禁大QMT策略进程一切 TCP 外连后，文件桥是唯一可用 RPC 通道：
+    大QMT策略端把 Redis 命令写成请求文件，本线程（桥）轮询读取、代为
+    执行、写回响应文件。详见 qmt-trader/大QMT文件桥通道方案.md。
+
+    失败降级策略：Redis 连不上或锁冲突（另一实例在跑且自愈失败）时
+    仅告警不阻断主流程（桥不启动，交易通道不可用会在业务侧自行报错）；
+    在业务模块导入之前启动（桥的 prepare() 会清空在途 req/resp，且
+    PositionManager 导入期就会 ping 大QMT）。
+    """
+    if not getattr(config, "ENABLE_QMT_FILE_BRIDGE", False):
+        logger.info("文件桥未启用 (ENABLE_QMT_FILE_BRIDGE=False)")
+        return
+
+    # 照抄 position_manager._create_qmt_trader 的 sys.path 先例：插入
+    # qmt-trader 目录后 import 桥模块。线程化后桥还能继承本进程
+    # config._load_dotenv_fallback 注入的环境变量（独立启动吃不到 .env）。
+    import os as _os
+    import sys as _sys
+    _bridge_dir = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "qmt-trader")
+    if _bridge_dir not in _sys.path:
+        _sys.path.insert(0, _bridge_dir)
+    try:
+        from qmt_relay_common import build_redis_client
+        from qmt_file_relay import FileRelayDaemon, FileRelayLockedError
+    except Exception as e:
+        logger.warning(f"⚠️ 文件桥模块加载失败:{str(e)[:50]}，主流程继续")
+        return
+
+    # Redis 连接复用 QMT_RPC_REDIS；ping 重试失败告警降级不阻断主流程。
+    rpc = config.QMT_RPC_REDIS
+    client = build_redis_client(
+        rpc.get("host", "127.0.0.1"),
+        rpc.get("port", 6379),
+        rpc.get("db", 5),
+        rpc.get("password", ""),
+    )
+    for attempt in range(1, 6):
+        try:
+            client.ping()
+            break
+        except Exception as exc:
+            logger.warning(f"文件桥 Redis 未就绪({str(exc)[:40]})，重试 {attempt}/5")
+            time.sleep(1.5)
+    else:
+        logger.warning("⚠️ 文件桥连不上 Redis，桥不启动，主流程继续")
+        return
+
+    daemon = FileRelayDaemon(
+        config.QMT_FILE_DIR,
+        client,
+        token=getattr(config, "QMT_FILE_TOKEN", ""),
+        key_prefix=getattr(config, "QMT_FILE_KEY_PREFIX", "bigqmt:"),
+        poll_interval=getattr(config, "QMT_FILE_POLL_INTERVAL", 0.002),
+    )
+
+    def _serve():
+        try:
+            daemon.serve_forever()
+        except FileRelayLockedError as exc:
+            # 桥内已自愈一次（锁内 pid 已死则清锁重试）；仍失败说明确有
+            # 活实例在跑（或锁不可删），降级：桥不启动，主流程继续。
+            logger.warning(f"⚠️ 文件桥锁冲突，桥不启动:{str(exc)[:80]}")
+        except Exception as exc:
+            logger.error(f"文件桥线程异常退出:{str(exc)[:50]}")
+
+    thread = threading.Thread(target=_serve, name="FileBridge", daemon=True)
+    thread.start()
+
+    # 等待就绪或线程退出（锁冲突会立即抛出结束线程）：prepare() 清空在途
+    # req/resp，ready 置位前业务侧不应发请求。
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        if daemon.ready.is_set() or not thread.is_alive():
+            break
+        time.sleep(0.05)
+
+    if daemon.ready.is_set():
+        def _stop_file_bridge():
+            # 先 stop 再 join（timeout=2）：清理路径中由 threads 遍历统一调用。
+            daemon.stop()
+            if thread.is_alive():
+                thread.join(timeout=2)
+
+        threads.append(("file_bridge", _stop_file_bridge))
+        logger.info(f"✅ 文件桥已启动 (dir:{config.QMT_FILE_DIR})")
+    else:
+        if thread.is_alive():
+            daemon.stop()
+            thread.join(timeout=2)
+        logger.warning("⚠️ 文件桥启动失败（未就绪），降级为不启动，主流程继续")
+
+
+# 文件桥必须早于下面的业务模块导入：web_server 导入时经 get_trading_executor()
+# 创建 PositionManager 并同步 ping 大QMT，桥不在线则 ping 必然超时、启动转离线。
+# 仅直接运行时启动，测试 import main 不拉起桥线程。
+if __name__ == "__main__":
+    start_file_bridge_thread()
+
 from maintenance import schedule_database_maintenance
 from data_manager import get_data_manager
 from indicator_calculator import get_indicator_calculator
@@ -61,11 +170,7 @@ from web_server import start_web_server
 from config_manager import get_config_manager
 from thread_monitor import get_thread_monitor
 
-# 获取logger
-logger = get_logger("main")
-
 # 全局变量
-threads = []
 stop_event = threading.Event()
 system_start_time = None  # 系统启动时间
 heartbeat_thread = None  # 心跳日志线程
@@ -650,7 +755,7 @@ def main():
         # 计算初始指标
         calculate_initial_indicators(indicator_calculator)
 
-        # 启动各个线程
+        # 启动各个线程（文件桥已在本模块顶层启动）
         start_data_thread(data_manager)
         start_position_thread(position_manager)
         start_strategy_thread(trading_strategy)

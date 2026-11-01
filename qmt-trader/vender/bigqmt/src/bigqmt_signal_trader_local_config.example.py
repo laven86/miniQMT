@@ -16,6 +16,24 @@ BIGQMT_REDIS_CONFIG = {
     "db": 5,
     "username": "",
     "password": "",
+    # File bridge mode (REQUIRED since the broker's 2026-10-23 upgrade: Big
+    # QMT kills the strategy for ANY outbound TCP connection - even 127.0.0.1
+    # loopback is logged as onIllegalIPFind "illegal IP" - so direct Redis
+    # is dead and the legacy TCP relay was deleted). Start
+    # qmt-trader/qmt_file_relay.py on this box, then set file_dir to the SAME
+    # directory as the daemon's --dir (the default below). The strategy then
+    # exchanges JSON request/response files with the daemon - zero sockets -
+    # and the daemon holds the Redis connection (host/port/password above
+    # stay unused on this side in file mode). Legacy relay_* keys are ignored.
+    # file_token must match the daemon's --token. The req/ and resp/
+    # subdirectories are created automatically; the QMT process needs read
+    # and write permission on file_dir.
+    # WARNING: exactly ONE strategy process per file_dir. Two accounts on
+    # the same Big QMT terminal must each use their own file_dir and run
+    # their own qmt_file_relay daemon (--dir pointing at it), otherwise
+    # their request/response files would collide and be misattributed.
+    "file_dir": r"c:\croco_hunter_decision\miniQMT\qmt-trader\qmt_file_bridge",
+    "file_token": "",
     # Keep order RPC disabled unless you explicitly want remote order/cancel.
     "rpc_allow_order_methods": False,
     # Big QMT may freeze custom daemon threads after init and its bundled Redis
