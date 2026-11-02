@@ -241,6 +241,7 @@ print('asset:', t.query_stock_asset())   # 期望返回真实资产
 | order_id 无法撤单 (`未找到 order_sys_id`) | 委托回报尚未到达，sysid 未回填 | 稍等 1–2s（轮询回填）后再撤；已终态委托本就无法撤 |
 | 撤单/下单卡顿 | Redis 跨机网络抖动 | 优先同机 Redis；`QMT_RPC_TIMEOUT_SECONDS` 可适当调大 |
 | 下单后委托查不到 | strategy_name 不匹配 | miniQMT 端下单时传 `strategy_name="bigqmt_signal_trader"`（与大QMT RPC 运行时的 strategy_name 一致）；不带此参数则 query_orders 过滤不到该笔单 |
+| 下单有回执但柜台零痕迹，ping 却正常，委托/成交查询空或超时 | 大QMT 客户端内交易会话失效（详见第六节） | 在QMT客户端内停止并重跑模型策略（约25秒），恢复后最小单实测；miniQMT 侧重启无效 |
 
 ---
 
@@ -253,3 +254,37 @@ set ENABLE_QMT_RPC_FALLBACK=false
 ```
 
 → 工厂回落到默认 `easy_qmt_trader`（xttrader 直连）或你原用的后端。
+
+---
+
+## 六、交易会话失效故障（2026-11-02 实战定式）
+
+**故障指纹**（ping 通 + 回执正常 + 无 sysid + 委托/成交查询空或超时）：
+- miniQMT 日志大量 "QMT 连接断开"但 ping 探测秒恢复（假恢复）；
+- `RPC下单已提交` 有回执（返回 `bq:xxx:rpc-xxx`），但柜台委托页/成交页零痕迹；
+- 本地交易记录照常落库（前端"有记录却查不到"是本地表与柜台实查双口径差异）。
+
+**根因**：大QMT 客户端（策略跑在 XtItClient 进程内）内部交易会话失效——策略线程
+存活所以 ping/回执全通，但 passorder 委托被静默丢弃、get_trade_detail_data
+(ORDER/DEAL) 返回空或阻塞。诱因疑似客户端与柜台连接闪断重连后未重绑策略会话
+（QMT 客户端日志不落盘，无法实锤）。miniQMT 侧重启无效（14:18 已实证）。
+
+**处置**（约 25 秒，无需重启 QMT 客户端）：
+1. 在 QMT 客户端内**停止并重新运行**模型策略（【模型交易】实盘）；
+2. 恢复后**先下最小单实测**（100 股→撤单），确认日志出现 `sysid=63xxxxxx`；
+3. miniQMT 日志无 `[ORDER_CONFIRM]` 告警即确认会话健康。
+
+**防线日志样例**（miniQMT 侧已内置，触发即按上面处置）：
+
+```
+[ORDER_CONFIRM] RPC下单 sell 588080.SH 180000股 order_id=xxx 提交已超15s仍未见柜台委托记录，
+交易会话疑似失效（ping正常≠会话可用）。请核对柜台委托页；处置：在QMT客户端内停止并重新运行模型策略，
+恢复后先下最小单验证。
+[MONITOR] QMT RPC ping 已恢复，但存在回执后未进柜台的委托（交易会话疑似失效），保持断连状态；
+处置：在QMT客户端内停止并重新运行模型策略
+```
+
+**防线机制**（qmt_rpc_trader.py）：下单回执后 15 秒（`QMT_RPC_ORDER_CONFIRM_TIMEOUT`
+可调）柜台查询仍无该委托 → 告警一次并置 `session_suspect`；疑似期间 connect/恢复
+探测拒绝标记恢复（前端连接徽标保持"断开"，不再假恢复）；任一新委托被柜台查询
+确认后自动解除；跨日自动失效。配套修复：回调注册去重（消断连风暴/事件重复处理）。

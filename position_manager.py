@@ -418,6 +418,13 @@ class PositionManager:
         try:
             if not trader.ping_xttrader():
                 return False
+            if getattr(trader, 'session_suspect', False):
+                # 堵住假恢复：ping 只证明策略线程活着（2026-11-02 故障：会话失效期 ping 全通，
+                # 假恢复后下单全部蒸发）。会话恢复实证 = 任一委托重新出现在柜台查询中。
+                logger.error('[MONITOR] QMT RPC ping 已恢复，但存在回执后未进柜台的委托'
+                             '（交易会话疑似失效），保持断连状态；'
+                             '处置：在QMT客户端内停止并重新运行模型策略')
+                return False
             ensure_push_ready = getattr(trader, 'ensure_trade_push_ready', None)
             if callable(ensure_push_ready) and not ensure_push_ready():
                 logger.warning('[MONITOR] QMT 同步查询已恢复，但交易主推订阅未恢复，保持断连状态')

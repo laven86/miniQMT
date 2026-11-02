@@ -14,6 +14,8 @@ QmtRpcTrader 大QMT RPC 交易客户端测试（基于 xtquant_big_convert）
 - 资金校验：check_stock_is_av_buy / sell
 - 委托/成交查询：别名方法 today_entrusts / today_trades
 - 回调：reconcile 后触发 order_callback / trade_callback（去重）
+- 回调注册去重：重复注册同一回调只保留一份（2026-11-02 断连风暴修复）
+- 落地确认 watchdog：回执后 N 秒柜台未见委托 → 告警 + session_suspect（假成功/假恢复防线）
 - 健康诊断：get_rpc_health() 快照
 - 边界：零 volume / order_id_map 超 4096 / config 缺失 / 空持仓
 
@@ -24,12 +26,14 @@ import os
 import sys
 import time
 import threading
+from unittest.mock import patch
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _ROOT)
 sys.path.insert(0, os.path.join(_ROOT, "qmt-trader"))
 
 import config
+import qmt_rpc_trader
 from qmt_rpc_trader import QmtRpcTrader
 import _qmt_trader_base as base
 
@@ -786,6 +790,110 @@ class QmtRpcTraderTest(unittest.TestCase):
             t._reconcile(o)
         result = t.xt_trader.cancel_order_stock(t.acc, oid)
         self.assertEqual(result, 0)
+
+    # ==================================================================
+    # 回调注册去重（新增：2026-11-02 断连风暴修复）
+    # ==================================================================
+
+    def test_duplicate_callback_registration_is_deduped(self):
+        """同一回调重复注册只保留一份：position_manager._probe_qmt_recovered
+        每次恢复成功都会重注册三个回调，裸 append 会造成断连风暴
+        （一次断连扇出 N 组日志）+ 成交/委托事件重复处理。"""
+        t = self._make()
+        fired = []
+
+        def cb():
+            fired.append(1)
+
+        t.register_disconnect_callback(cb)
+        t.register_disconnect_callback(cb)  # 二次注册同一函数
+        self.assertEqual(len(t._disconnect_callbacks), 1)
+        t._on_disconnect()
+        self.assertEqual(len(fired), 1)
+
+    def test_bound_method_repeated_registration_is_deduped(self):
+        """bound method 重复注册也去重（== 比较同实例同函数）。"""
+        class Holder:
+            def on_dc(self):
+                pass
+
+        h = Holder()
+        t = self._make()
+        t.register_disconnect_callback(h.on_dc)
+        t.register_disconnect_callback(h.on_dc)  # 新的 bound 对象，语义相等
+        self.assertEqual(len(t._disconnect_callbacks), 1)
+
+    # ==================================================================
+    # 下单落地确认 watchdog（新增：2026-11-02 假成功/假恢复修复）
+    # ==================================================================
+
+    def test_order_confirm_alerts_when_order_missing_from_counter(self):
+        """回执成功但柜台查询不到委托 → 告警一次并置 session_suspect。
+
+        复现 2026-11-02 故障形态：交易会话失效时 ping/回执照常，
+        passorder 委托被静默丢弃（含一笔 180000 股卖出假成功）。"""
+        t = self._make()
+        oid = t.buy("600000.SH", amount=100, price=10.0)
+        self.assertIn(oid, t._pending_confirm)
+        # 模拟交易会话失效：委托被 passorder 静默丢弃，柜台查询恒空
+        t._bq.client._orders.clear()
+        # 推进时钟：超过确认超时（默认 15s）
+        t._pending_confirm[oid]["placed_at"] -= 20
+        with patch.object(qmt_rpc_trader.logger, "error") as mock_err:
+            t._check_pending_confirmations()
+            self.assertTrue(mock_err.called)
+            self.assertIn("交易会话疑似失效", mock_err.call_args[0][0])
+        self.assertTrue(t.session_suspect)
+        self.assertTrue(t._pending_confirm[oid]["alerted"])
+        self.assertTrue(t.get_rpc_health()["session_suspect"])
+        # 幂等：告警只发一次
+        with patch.object(qmt_rpc_trader.logger, "error") as mock_err2:
+            t._check_pending_confirmations()
+            mock_err2.assert_not_called()
+
+    def test_order_confirm_clears_suspect_when_order_lands(self):
+        """会话恢复实证：新委托重新出现在柜台查询中 → pending 弹出 + suspect 解除。"""
+        t = self._make()
+        oid1 = t.buy("600000.SH", amount=100, price=10.0)
+        t._bq.client._orders.clear()  # 会话失效，旧单蒸发
+        t._pending_confirm[oid1]["placed_at"] -= 20
+        t._check_pending_confirmations()  # 触发告警
+        self.assertTrue(t.session_suspect)
+        # 用户重跑大QMT策略后会话恢复：新下单重新可见
+        oid2 = t.buy("600000.SH", amount=100, price=10.0)
+        t._read_all_orders()  # 轮询 reconcile → 回填 sysid + 弹出 pending
+        self.assertNotIn(oid2, t._pending_confirm)
+        self.assertFalse(t.session_suspect)
+        self.assertIn(oid1, t._pending_confirm)  # 蒸发旧单保留实证（30分钟后退休）
+
+    def test_pending_confirm_retires_after_30_minutes(self):
+        """超30分钟未确认：告警已发过，静默退休防内存增长（兼防收盘后误报）。"""
+        t = self._make()
+        oid = t.buy("600000.SH", amount=100, price=10.0)
+        t._pending_confirm[oid]["placed_at"] -= 1801
+        t._check_pending_confirmations()
+        self.assertNotIn(oid, t._pending_confirm)
+
+    def test_connect_refused_while_session_suspect(self):
+        """session_suspect 时 connect() 拒绝标记恢复（堵住重连 worker 假恢复路径）。"""
+        t = self._make(alive=True)
+        oid = t.buy("600000.SH", amount=100, price=10.0)
+        t._bq.client._orders.clear()
+        t._pending_confirm[oid]["placed_at"] -= 20
+        t._check_pending_confirmations()
+        self.assertTrue(t.session_suspect)
+        self.assertIsNone(t.connect())
+        self.assertFalse(t._connected)
+
+    def test_session_suspect_expires_next_day(self):
+        """跨日自动解除：昨日的疑似实证不阻塞今天的连接。"""
+        t = self._make(alive=True)
+        t._session_suspect = True
+        t._suspect_date = "2000-01-01"  # 非今天
+        t._check_pending_confirmations()
+        self.assertFalse(t.session_suspect)
+        self.assertIsNotNone(t.connect())
+        self.assertTrue(t._connected)
 
     # ==================================================================
     # 健康诊断（新增）

@@ -170,6 +170,12 @@ class QmtRpcTrader:
         self._seen_deals = {}      # int_id -> 已推送过的累计成交量
         self._order_first_seen = {}  # 外部委托键 -> 首见时刻（柜台无时间时兑底）
 
+        # 下单落地确认：回执只证明 handler 执行过，委托出现在柜台查询中才算落地
+        # （2026-11-02 故障：交易会话失效时回执照常返回但委托被 passorder 静默丢弃）
+        self._pending_confirm = {}   # int_id -> {'placed_at', 'alerted', 'desc'}
+        self._session_suspect = False  # True=存在回执后未进柜台的实证（ping正常≠会话可用）
+        self._suspect_date = None      # 疑似实证发生日，跨日自动失效
+
         # 回调列表
         self._trade_callbacks = []
         self._order_callbacks = []
@@ -192,6 +198,13 @@ class QmtRpcTrader:
         try:
             if not self._is_alive():
                 logger.error('QmtRpcTrader 连接失败: 大QMT RPC ping 无响应，请确认大QMT端脚本在运行')
+                self._connected = False
+                return None
+            if self._session_suspect:
+                # 堵住重连 worker 的假恢复路径：ping 只证明策略线程活着。
+                # 会话恢复实证 = 任一委托重新出现在柜台查询中（_reconcile 回填）。
+                logger.error('QmtRpcTrader 拒绝标记恢复: 存在回执后未进柜台的委托，'
+                             '交易会话疑似失效。请停止并重新运行大QMT模型策略')
                 self._connected = False
                 return None
             self._bq.register_callback(self._cb)
@@ -240,21 +253,32 @@ class QmtRpcTrader:
             'rpc_alive': self._is_alive(),
             'allow_order': self._allow_order,
             'tracked_orders': len(self._id_map),
+            'session_suspect': self._session_suspect,
+            'pending_confirm': len(self._pending_confirm),
             'poller_alive': bool(self._poller_thread and self._poller_thread.is_alive()),
         }
+
+    @property
+    def session_suspect(self):
+        """交易会话疑似失效（存在回执后未进柜台的委托）。ping 正常≠会话可用，
+        供 position_manager 恢复探测与 web 状态接口读取。"""
+        return self._session_suspect
 
     # ------------------------------------------------------------------
     # 回调注册 + 推送/轮询
     # ------------------------------------------------------------------
 
     def register_trade_callback(self, cb):
-        self._trade_callbacks.append(cb)
+        if cb not in self._trade_callbacks:
+            self._trade_callbacks.append(cb)
 
     def register_order_callback(self, cb):
-        self._order_callbacks.append(cb)
+        if cb not in self._order_callbacks:
+            self._order_callbacks.append(cb)
 
     def register_disconnect_callback(self, cb):
-        self._disconnect_callbacks.append(cb)
+        if cb not in self._disconnect_callbacks:
+            self._disconnect_callbacks.append(cb)
 
     def _start_poller(self):
         if self._poller_thread and self._poller_thread.is_alive():
@@ -278,6 +302,7 @@ class QmtRpcTrader:
                 if alive:
                     for o in self._read_all_orders():
                         self._maybe_fire_from_order(o)
+                self._check_pending_confirmations()
             except Exception as e:
                 logger.warning(f'RPC 兜底轮询异常: {e}')
             time.sleep(interval)
@@ -364,8 +389,41 @@ class QmtRpcTrader:
                 self._sysid_index[sysid] = int_id
                 if int_id in self._id_map:
                     self._id_map[int_id]['order_sys_id'] = sysid
+                if self._pending_confirm.pop(int_id, None) is not None:
+                    # 本进程委托已被柜台查询确认 = 落地确认 + 会话证实可用
+                    self._session_suspect = False
                 self._trim_tracking_locked()
             return int_id
+
+    def _check_pending_confirmations(self):
+        """下单落地确认 watchdog：回执只证明 handler 执行过，委托在柜台查询中出现才算落地。
+
+        背景（2026-11-02 故障）：大QMT客户端内策略交易会话失效时 ping/回执照常，
+        passorder 委托被静默丢弃。回执后 QMT_RPC_ORDER_CONFIRM_TIMEOUT 秒仍查询不到
+        该委托 → 告警一次并置 _session_suspect，供 connect()/恢复探测拒绝假恢复。
+        """
+        timeout = getattr(config, 'QMT_RPC_ORDER_CONFIRM_TIMEOUT', 15) if config else 15
+        now = int(time.time())
+        today = time.strftime('%Y-%m-%d')
+        # 跨日自动解除：昨日的疑似实证不阻塞今天的连接
+        if self._session_suspect and self._suspect_date != today:
+            self._session_suspect = False
+            self._suspect_date = None
+        for int_id in list(self._pending_confirm):
+            info = self._pending_confirm[int_id]
+            age = now - info['placed_at']
+            if age > 1800:  # 超30分钟未确认：告警已发过，静默退休防内存增长（兼防收盘后误报）
+                self._pending_confirm.pop(int_id, None)
+                continue
+            if age > timeout and not info['alerted']:
+                info['alerted'] = True
+                self._session_suspect = True
+                self._suspect_date = today
+                logger.error(
+                    f'[ORDER_CONFIRM] RPC下单 {info["desc"]} order_id={int_id} 提交已超{timeout}s'
+                    f'仍未见柜台委托记录，交易会话疑似失效（ping正常≠会话可用）。'
+                    f'请核对柜台委托页；处置：在QMT客户端内停止并重新运行模型策略，'
+                    f'恢复后先下最小单验证。')
 
     def _first_seen_order_time(self, o):
         """外部委托（非本进程所下）且柜台未回传时间时，锁定首次查询时刻，
@@ -530,6 +588,11 @@ class QmtRpcTrader:
                 self._return_index[str(int_id)] = int_id
                 self._return_index[wire_remark] = int_id
                 self.order_id_map[int_id] = int_id
+                # 回执只证明 handler 执行过；落地与否由 _check_pending_confirmations 核对
+                self._pending_confirm[int_id] = {
+                    'placed_at': int(time.time()), 'alerted': False,
+                    'desc': f'{action} {code} {int(volume)}股',
+                }
                 self._trim_tracking_locked()
             logger.info(f'RPC下单已提交: {action} {code} {volume}股 @ {price}, order_id={int_id}, 返回={ret_str}')
             return int_id

@@ -1339,6 +1339,7 @@ def debug_status():
             'qmt_trader_account': _safe(getattr(qmt_trader, 'account', None)),
             'qmt_acc_account_id': _mask_id(getattr(getattr(qmt_trader, 'acc', None), 'account_id', None)),
             'qmt_connected':      _safe(getattr(pm, 'qmt_connected', None)),
+            'qmt_session_suspect': _safe(getattr(qmt_trader, 'session_suspect', False)),
         }
         return jsonify({
             'status': 'success',
