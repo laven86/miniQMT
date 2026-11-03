@@ -456,6 +456,10 @@ class ChanOrderGateway:
                 return None
             if order['status'] not in ACTIVE:
                 return {'status': 'failed', 'message': '订单已终结'}
+            if str(order_id).startswith('chan:'):
+                # 提交回执只有备注标记（passorder 不返回柜台委托号），确认前该
+                # 标记不是 sysid，不能当撤单号发柜台——委托疑似未送达。
+                return {'status': 'failed', 'message': '委托未获柜台确认（柜台委托流无此单），无法撤单'}
             if ctx['mode'] == 'simulation':
                 order['status'] = 53 if order['traded_volume'] else 54
                 self._save(db, order)
